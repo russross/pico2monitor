@@ -1,0 +1,8 @@
+/deps/
+/build/
+/dist/
+/artifacts/
+/.venv/
+/.ruff_cache/
+__pycache__/
+*.py[cod]

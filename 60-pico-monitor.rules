@@ -1,0 +1,3 @@
+# Match only the firmware built in this directory, not other USB serial devices.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="000a", ATTR{product}=="RV32 SRAM monitor", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", ATTRS{product}=="RV32 SRAM monitor", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"

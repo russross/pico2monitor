@@ -1,0 +1,297 @@
+#include "monitor.h"
+#include "transfer.h"
+
+#include <string.h>
+
+static char line[2305];
+static size_t length;
+static bool prompt_pending, swallow_lf;
+static bool line_overflow;
+
+static void detach(void) {
+    static const char sequence[] = "\033]pico-console;detach\007";
+    console_write(sequence, sizeof(sequence) - 1);
+}
+
+void shell_prompt(void) {
+    prompt_pending = true;
+    length = 0;
+    line_overflow = false;
+}
+void shell_notice(const char *message) {
+    console_printf("\r\nsuspended: %s\r\n", message);
+    shell_prompt();
+}
+void shell_disconnected(void) {
+    program_suspend("console disconnected");
+    transfer_cancel("USB console disconnected");
+    length = 0;
+}
+void shell_init(void) {
+    console_printf("\r\nRV32 SRAM monitor 1\r\n");
+#ifdef MONITOR_EMULATOR
+    console_printf("EMULATOR BUILD: guests run in M-mode WITHOUT isolation\r\n");
+#else
+    console_printf("hart 0: M-mode monitor, U-mode guests; Ctrl-C/Escape suspends\r\n");
+#endif
+    shell_prompt();
+}
+
+static void info(void) {
+    console_printf("state: %s%s\r\n", program_state_name(program.state),
+                   program.reset_busy ? " (reset in progress)" : "");
+    if (program.valid) {
+        console_printf("image: %s size=%lu crc=%08lx entry=%08lx\r\n", program.image.name,
+                       (unsigned long)program.image.file_size, (unsigned long)program.image.crc,
+                       (unsigned long)program.image.entry);
+        for (uint32_t i = 0; i < program.image.segment_count; ++i) {
+            const Segment *s = &program.image.segments[i];
+            const char *permissions = s->permissions & PERM_W   ? "RW"
+                                      : s->permissions & PERM_X ? "RX"
+                                                                : "R";
+            console_printf("  %-2s %08lx mem=%lu file=%lu offset=%lu\r\n", permissions,
+                           (unsigned long)s->address, (unsigned long)s->memory_size,
+                           (unsigned long)s->file_size, (unsigned long)s->offset);
+        }
+        console_printf("stack: %08lx..%08lx RW; pc=%08lx sp=%08lx cpu-us=%llu\r\n",
+                       (unsigned long)program.image.plan.stack_base,
+                       (unsigned long)program.image.plan.stack_top, (unsigned long)program.frame.pc,
+                       (unsigned long)program.frame.x[2], (unsigned long long)program.cpu_us);
+        if (program.state == EXITED)
+            console_printf("exit status: %ld\r\n", (long)program.exit_status);
+        if (program.state == FAULTED)
+            console_printf("trap cause: %lu\r\n", (unsigned long)program.frame.cause);
+        if (program.state == STOPPED)
+            console_printf("stop reason: %s\r\n", program.stop_reason);
+    }
+    io_status();
+}
+
+/* Tokenization supports literal quoting and backslash escaping without shell
+ * expansion. Parsing completes before any command mutates program state. */
+static int tokenize(char **args) {
+    char *read = line, *write = line;
+    int count = 0;
+    while (*read) {
+        while (*read == ' ' || *read == '\t')
+            ++read;
+        if (!*read)
+            break;
+        if (count == 34)
+            return -1;
+        args[count++] = write;
+        char quote = 0;
+        while (*read && (quote || (*read != ' ' && *read != '\t'))) {
+            char c = *read++;
+            if (c == '\\' && quote != '\'') {
+                if (!*read)
+                    return -1;
+                *write++ = *read++;
+            } else if (c == quote)
+                quote = 0;
+            else if (!quote && (c == '\'' || c == '"'))
+                quote = c;
+            else
+                *write++ = c;
+        }
+        if (quote)
+            return -1;
+        while (*read == ' ' || *read == '\t')
+            ++read;
+        *write++ = 0;
+    }
+    return count;
+}
+
+typedef struct {
+    const char *name, *usage, *summary, *detail;
+} CommandHelp;
+
+static const CommandHelp commands[] = {
+    {"help", "help [COMMAND]", "Show command help", "Show all commands or details for COMMAND."},
+    {"load", "load", "Receive an ELF program",
+     "Arm the upload port; send an ELF with ./pico-send."},
+    {"info", "info", "Show program and I/O status",
+     "Show the loaded image, execution state, and I/O counters."},
+    {"map", "map", "Show the memory map", "Show the guest memory map and permissions."},
+    {"run", "run [ARG ...]", "Start the loaded program",
+     "Start a ready program with optional arguments. Reset an exited program before running "
+     "again."},
+    {"resume", "resume", "Resume a suspended program",
+     "Continue from the saved program state and pending system call."},
+    {"reset", "reset", "Reset the loaded program",
+     "Prepare the program to run again. Initialized writable data is restored only if a snapshot "
+     "was preserved."},
+    {"env", "env", "List guest environment",
+     "Show environment variables supplied to the next run."},
+    {"setenv", "setenv NAME VALUE", "Set a guest environment variable",
+     "Set NAME to VALUE for subsequent runs. Quote values containing spaces."},
+    {"unsetenv", "unsetenv NAME", "Remove a guest environment variable",
+     "Remove NAME from the environment for subsequent runs."},
+    {"reset-data", "reset-data auto|on|off", "Set snapshot policy",
+     "Set whether initialized writable data is preserved for reset. Some changes require reloading "
+     "the program."},
+    {"bootsel", "bootsel", "Reboot into USB boot mode",
+     "Restart the board in BOOTSEL mode for firmware upload."},
+    {"quit", "quit", "Detach pico-console", "Close the pico-console connection to the board."},
+};
+
+static void help(const char *name) {
+    if (!name) {
+        console_printf("Commands:\r\n");
+        for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i)
+            console_printf("  %-24s %s\r\n", commands[i].usage, commands[i].summary);
+        console_printf("Use help COMMAND for details. Ctrl-C/Escape suspends a guest.\r\n");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        if (strcmp(name, commands[i].name) == 0) {
+            console_printf("Usage: %s\r\n%s\r\n", commands[i].usage, commands[i].detail);
+            return;
+        }
+    }
+    console_printf("unknown command: %s\r\n", name);
+}
+
+static void execute(void) {
+    char *args[34];
+    int argc = tokenize(args);
+    if (argc <= 0) {
+        if (argc < 0)
+            console_printf("invalid quoting or too many arguments\r\n");
+        shell_prompt();
+        return;
+    }
+    const char *error = NULL;
+    if (strcmp(line, "run") != 0 && strcmp(line, "setenv") != 0 && strcmp(line, "unsetenv") != 0 &&
+        strcmp(line, "reset-data") != 0 && strcmp(line, "help") != 0 && argc != 1) {
+        console_printf("unexpected command arguments\r\n");
+        shell_prompt();
+        return;
+    }
+    if (strcmp(line, "help") == 0) {
+        if (argc > 2)
+            error = "usage: help [COMMAND]";
+        else
+            help(argc == 2 ? args[1] : NULL);
+    } else if (strcmp(line, "map") == 0)
+        memory_map_start();
+    else if (strcmp(line, "env") == 0)
+        environment_print();
+    else if (strcmp(line, "setenv") == 0)
+        error = argc == 3 ? environment_set(args[1], args[2]) : "usage: setenv NAME VALUE";
+    else if (strcmp(line, "unsetenv") == 0)
+        error = argc == 2 ? environment_set(args[1], NULL) : "usage: unsetenv NAME";
+    else if (strcmp(line, "reset-data") == 0) {
+        if (argc != 2 ||
+            (strcmp(args[1], "auto") && strcmp(args[1], "on") && strcmp(args[1], "off")))
+            error = "usage: reset-data auto|on|off";
+        else {
+            snapshot_policy = !strcmp(args[1], "auto") ? SNAP_AUTO
+                              : !strcmp(args[1], "on") ? SNAP_ON
+                                                       : SNAP_OFF;
+            if (program.valid && program.image.plan.snapshot) {
+                program.image.plan.requested = snapshot_policy;
+                program.release_snapshot =
+                    snapshot_policy == SNAP_OFF ||
+                    (snapshot_policy == SNAP_AUTO &&
+                     program.image.plan.heap_limit - program.image.plan.heap_base < HEAP_RESERVE);
+                console_printf("setting saved; snapshot %s on next reset\r\n",
+                               program.release_snapshot ? "released" : "retained");
+            } else if (program.valid && snapshot_policy != SNAP_OFF)
+                console_printf("setting saved; reload to preserve initialized writable data\r\n");
+            else
+                console_printf("setting saved for next load\r\n");
+        }
+    } else if (strcmp(line, "info") == 0)
+        info();
+    else if (strcmp(line, "load") == 0) {
+        transfer_arm();
+        return;
+    } else if (strcmp(line, "reset") == 0) {
+        if (!program.valid)
+            console_printf("no loaded program\r\n");
+        else {
+            program_reset();
+            return;
+        }
+    } else if (strcmp(line, "run") == 0) {
+        error = program_launch((unsigned)argc - 1, (const char *const *)(args + 1));
+        if (!error)
+            return;
+    } else if (strcmp(line, "resume") == 0) {
+        if (program.state != STOPPED)
+            console_printf("resume requires a suspended program\r\n");
+        else {
+            program.state = program.stopped_state;
+            guest_input_clear();
+            return;
+        }
+    } else if (strcmp(line, "quit") == 0) {
+        detach();
+    } else if (strcmp(line, "bootsel") == 0)
+        monitor_bootsel();
+    else if (length)
+        console_printf("unknown command: %s\r\n", line);
+    if (error)
+        console_printf("%s\r\n", error);
+    shell_prompt();
+}
+
+void shell_input(uint8_t byte) {
+    if (byte == 4) {
+        detach();
+        return;
+    }
+    if (transfer_active()) {
+        if (byte == 3 || byte == 27)
+            transfer_cancel("cancelled from console");
+        return;
+    }
+    if (program.reset_busy || prompt_pending)
+        return;
+    if (byte == '\n' && swallow_lf) {
+        swallow_lf = false;
+        return;
+    }
+    swallow_lf = byte == '\r';
+    if (byte == 3 || byte == 27) {
+        console_printf("\r\n");
+        shell_prompt();
+        return;
+    }
+    if (byte == 8 || byte == 127) {
+        if (length) {
+            --length;
+            console_printf("\b \b");
+        }
+        return;
+    }
+    if (byte == '\r' || byte == '\n') {
+        if (line_overflow) {
+            console_printf("\r\ncommand line exceeds 2304 characters\r\n");
+            shell_prompt();
+            return;
+        }
+        line[length] = 0;
+        console_printf("\r\n");
+        execute();
+        length = 0;
+    } else if (byte >= 32 && byte < 127) {
+        if (length < sizeof(line) - 1) {
+            line[length++] = (char)byte;
+            console_write(&byte, 1);
+        } else
+            line_overflow = true;
+    }
+}
+
+void shell_step(void) {
+    memory_map_step();
+    if (prompt_pending && console_connected() && console_empty() && !program.reset_busy &&
+        !memory_map_busy() && program.state != RUNNING && program.state != WAITING &&
+        !transfer_active()) {
+        console_printf("pico> ");
+        prompt_pending = false;
+    }
+}

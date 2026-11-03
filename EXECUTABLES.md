@@ -1,0 +1,134 @@
+Preparing and running executables
+=================================
+
+This monitor runs one assembly or freestanding C program on a Pico 2's RISC-V core. It supplies a small Linux-style userspace: static executables, a startup stack, console syscalls, and a brk heap. Programs link to physical SRAM addresses and use only the supported syscalls.
+
+The monitor and hardware resources are always protected. Protections inside the guest sandbox are best effort: the monitor protects text, constants, stack boundaries, and other memory when PMP entries permit it. A bad access inside the sandbox may succeed. Use `map` to inspect the actual permissions for your image.
+
+
+Build an assembly program
+-------------------------
+
+`tests/hello.S` is the complete assembly example. It starts at `_start`, writes a message with syscall 64, and exits with syscall 93. Build it using the toolchain's default linker script, changing only the text-segment base:
+
+    ./deps/toolchain/bin/riscv32-pico-elf-gcc \
+        -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
+        -nostdlib -static -fno-pie -no-pie \
+        -Wl,-Ttext-segment=0x20020000,-e,_start \
+        tests/hello.S -o hello.elf
+
+`make build/assembly.elf` builds the same example with debug information. `make build/exec.elf` builds `tests/guest_exec.c` using the supplied startup and helper functions, also with the default linker script. `tests/guest.ld` remains a fixed-layout regression fixture for older demonstrations and protection probes; new programs do not need it.
+
+Inspect a file before uploading:
+
+    ./deps/toolchain/bin/riscv32-pico-elf-readelf -h -l hello.elf
+
+Check ELF32, little endian, RISC-V, EXEC, and the entry address. The monitor loads PT_LOAD program headers, not individual sections. FileSiz is initialized content; MemSiz also includes zero-filled memory. Debug information and other non-loadable metadata occupy transfer bytes but no guest SRAM.
+
+The recommended base is 0x20020000. Flash firmware accepts load destinations from 0x20018000; the SRAM-executing monitor requires 0x20020000 or higher. The upper bound is 0x20080000, with space below it needed for a 16 KiB stack and optional snapshots. `map` reports the final layout. Link addresses are not relocated during loading.
+
+Files must be static little-endian ELF32 RISC-V ET_EXEC using soft-float ILP32. Compressed instructions are supported. Floating-point ABI, RV32E, dynamic linking, TLS, and executable-stack requests are unsupported. Unsupported instructions fault during execution. There may be at most sixteen program headers, all within the first 4096 bytes. Files may be 52 bytes through 1 MiB; a valid executable normally needs more than the minimum header. Stripped files and loadable headers are supported.
+
+Multiple load segments, arbitrary ordering, and RWX segments are allowed. Overlapping initialized destinations must name identical source file bytes. There is no requirement to split text, constants, and data into predetermined slots.
+
+
+Upload and iterate
+------------------
+
+1. Connect with `./dist/pico-console`. Ctrl-D at the monitor prompt, Ctrl-], and `quit` at the monitor prompt detach. Ctrl-C and Escape are sent to the board.
+2. Type `load` at the monitor prompt.
+3. In another host terminal, run `./dist/pico-send hello.elf`.
+4. Inspect the automatic memory map and type `run`, optionally followed by arguments.
+5. Use Ctrl-C/Escape to suspend, `resume` to continue, or `reset` then `run` to restart.
+
+Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The console and upload use separate USB CDC interfaces. Both utilities select stable device identities automatically; use `--port DEVICE` when needed. Console uses the interface ending in -if00; upload uses -if02. Ordinary terminal software also works with local echo disabled.
+
+A rejected header or memory plan preserves the previous image, including a suspended context. Once replacement begins, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
+
+Zero exit is silent; nonzero exit prints its status. Faults show the cause, PC, and SP. The chip does not supply a reliable faulting address. Exited or faulted programs require reset before another run. Infinite loops can still be suspended by the monitor timer.
+
+
+Arguments and environment
+-------------------------
+
+    setenv COURSE "assembly lab"
+    run one "two words" ""
+    env
+    unsetenv COURSE
+
+The image's uploaded filename becomes argv[0]. Quoting supports single quotes, double quotes, and backslash escaping outside single quotes. There is no variable expansion, command substitution, or shell pipeline syntax. Environment starts empty and persists in monitor settings until changed or the monitor restarts.
+
+Limits are 32 arguments including argv[0], 32 environment entries, and 2048 combined bytes of argument/environment strings including NUL terminators. A command line may contain 2304 characters. A rejected launch leaves the program ready.
+
+At `_start`, sp is aligned to 16 bytes. Memory starting there contains:
+
+    argc
+    argv[0] ... argv[argc-1], NULL
+    envp[0] ... envp[n-1], NULL
+    auxiliary-vector type/value pairs, AT_NULL/0
+
+Pointers refer to NUL-terminated strings in the guest stack. The auxiliary vector includes AT_PAGESZ=4096 and AT_ENTRY. AT_PHDR, AT_PHENT, and AT_PHNUM are supplied when the program-header table is itself loaded. The nominal page size does not imply an MMU. Do not depend on other registers at raw entry; the supplied startup also receives convenience copies of argc/argv/envp in a0/a1/a2.
+
+`tests/guest_start.S` initializes gp with relaxation disabled, derives arguments from sp, calls `main(int argc, char **argv, char **envp)`, and exits with its result. Link this startup exactly once. Pure assembly may supply its own `_start` and use the initial stack directly. Maintain 16-byte stack alignment and normal RISC-V register conventions when calling functions. Do not return from `_start`; invoke exit.
+
+
+Syscalls
+--------
+
+Put the syscall number in a7 and arguments in a0 through a5, then execute ecall. Results appear in a0. Ordinary failures return negative errno directly; there is no monitor-managed errno variable. Other integer registers are preserved across syscalls and interrupts.
+
+| Number | Call | Supported arguments and behavior |
+| ------ | ---- | -------------------------------- |
+| 63 | read | a0=0, a1=buffer, a2=count; waits for console input |
+| 64 | write | a0=1 or 2, a1=buffer, a2=count; console output |
+| 93 | exit | a0=status; ends execution |
+| 94 | exit_group | Same behavior as exit |
+| 124 | sched_yield | No arguments |
+| 214 | brk | a0=requested end; zero queries current break |
+| 403 | clock_gettime64 | a0=1 (CLOCK_MONOTONIC), a1=timespec pointer |
+| 407 | clock_nanosleep_time64 | a0=1, a1=0 (relative), a2=request timespec, a3 ignored |
+
+Timespec contains two signed 64-bit little-endian integers: seconds and nanoseconds. Nanoseconds must be in 0..999999999. Monotonic time is board uptime; suspension preserves an outstanding sleep's deadline. Absolute sleeps and other clock IDs return -EINVAL. Relative sleeps are rounded upward to microseconds. The remaining-time argument is unused because this environment has no signal interruption.
+
+Reads may return fewer bytes than requested, currently at most 256 per completion. Writes wait until all requested bytes have entered the monitor output queue; they do not wait for USB delivery. Zero-length calls do not dereference their pointer. Invalid descriptors return -EBADF (-9), invalid buffers return -EFAULT (-14), invalid sizes/arguments return -EINVAL (-22), and unsupported syscalls return -ENOSYS (-38). Ctrl-D at the start of a guest input line completes a read with zero bytes; after typed characters it submits those characters without a newline. Ctrl-C and Escape are monitor controls rather than guest input.
+
+brk returns the resulting break, not a negative errno. An invalid request returns the unchanged break. The heap begins after the highest load segment; `brk(0)` discovers it without linker symbols. Growth zeroes newly allocated bytes, including bytes exposed again after shrinking. Growth cannot cross the reported heap limit. Syscall buffers may use heap bytes only below the current break; PMP may permit direct loads/stores beyond that logical limit. Reset returns the break to its initial value.
+
+A freestanding C runtime can use `tests/guest.h` and `tests/guest.c`. A general static libc may need additional syscalls, initialization, or TLS; static linkage alone does not establish compatibility. Binaries using this project's former private syscall numbers must be rebuilt.
+
+
+Reset and memory pressure
+-------------------------
+
+    reset-data auto
+    reset-data on
+    reset-data off
+    map
+
+AUTO preserves original initialized writable bytes when enough memory remains for at least 32 KiB of heap capacity. ON preserves them whenever they fit, warns below that threshold, and is overridden when preservation cannot fit or be isolated. OFF avoids that storage. Settings apply to subsequent loads; for an existing snapshot they also determine retention or release at the next reset. AUTO can release a tight snapshot; ON cancels a pending release.
+
+The map shows requested and effective policy, snapshot payload bytes, reserved bytes including alignment padding, and heap capacity. A stack-sized snapshot boundary is preferred because it produces better PMP mappings; a compact boundary is tried when needed to fit. There is no fixed text/data/rodata size limit independent of the available arena.
+
+With preservation enabled, reset restores initialized writable data and clears BSS, heap, stack, and transient padding. Immutable image contents remain intact. With preservation disabled, reset preserves initialized writable bytes as they currently stand and clears writable zero-fill and transient storage. Thus a modified global initializer can remain modified on the next run.
+
+Selecting OFF with an existing snapshot schedules reclamation: reset restores initialized data one final time, erases the protected copy, moves the stack upward, and enlarges heap capacity. Until that reset, selecting ON cancels release. After reclamation, enabling preservation requires reloading the ELF. Current mutated bytes cannot reconstruct the original file.
+
+
+Read the memory map
+-------------------
+
+`map` prints ELF requirements, heap/break, stack, snapshot accounting, and actual PMP entries. The lowest-numbered matching entry wins; entries can overlap. A broad RWX grant can therefore contain earlier RX, RW, or denied exceptions. The system-wide denial is always installed after those entries.
+
+Protections prioritize a useful stack guard, text write protection, constant-data write protection, non-executable writable memory, then denial of unused space. Boundaries may grant more access than ELF requests. A large stack adjustment can skip a guard. Do not make program correctness depend on an internal guard or permission fault.
+
+`info` shows saved execution state and I/O statistics. Monitor memory reporting shows static SRAM extent, reserved normal-stack bytes, and observed stack high-water use since main began. That observation excludes earlier SDK startup and is not a proof of worst-case usage.
+
+
+Troubleshooting
+---------------
+
+*   Load rejected: inspect architecture, static linkage, physical destinations, program-header limits, conflicting initialization, and space for the stack.
+*   Unexpected fault: inspect PC/SP and effective PMP entries. An unsupported instruction, privileged CSR access, or device access also faults.
+*   Syscall returned an error: check the number, descriptor, pointer permissions, allocation bounds, and negative errno.
+*   Reset changed behavior: inspect effective reset-data policy, arguments, and environment. Initialized bytes persist without a snapshot.
+*   Upload failed: read whether the previous image was preserved. Repeat the upload if replacement had started.
