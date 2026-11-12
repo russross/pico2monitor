@@ -21,7 +21,7 @@
 #define IO_CHUNK 256u
 
 typedef enum { PERM_NONE = 0, PERM_X = 1, PERM_W = 2, PERM_R = 4 } Permission;
-typedef enum { SNAP_AUTO, SNAP_ON, SNAP_OFF } SnapshotPolicy;
+typedef enum { SNAP_AUTO, SNAP_OFF } SnapshotPolicy;
 typedef struct {
     uint32_t base, size;
     uint8_t permissions;

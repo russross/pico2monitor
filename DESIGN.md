@@ -14,15 +14,15 @@ Decisions and rationale
 
 *   ELF permissions, runtime allocations, and effective PMP permissions are distinct data. This prevents padding and best-effort protections from being mistaken for exact ELF mappings.
 *   The NAPOT tree solver spends seven configurable entries on guards, text write protection, read-only-data write protection, writable-memory execute protection, then unused-space denial. The eighth entry always denies the entire address space, overriding the hardware's hardwired peripheral grants.
-*   The solver uses bounded static dynamic-programming workspace and terminates uniform subtrees. An independent effective-map verifier checks trusted boundaries and required permissions before replacement.
+*   The solver uses bounded dynamic-programming workspace in disposable guest SRAM and terminates uniform subtrees. An independent effective-map verifier checks trusted boundaries and required permissions before writing segment destinations.
 *   The recommended text base remains 0x20020000 for compatibility between flash and SRAM monitor builds. Measured allocations and compiler stack reports support reducing the flash reservation to 96 KiB; the SRAM build keeps 128 KiB because it also holds executable code. Both retain an 8 KiB normal stack.
 *   Four-byte instructions may start two bytes before a NAPOT boundary. Hardware testing established that a fetch spanning different first-match entries faults even when both grant X. The solver and independent verifier therefore preserve one effective entry across continuous executable granules. This deliberately sacrifices some partial text protection to keep valid instructions executable.
 *   Static ELF32 ET_EXEC uses p_vaddr as destination. No dynamic linking, TLS, relocation, or physical/virtual translation is implemented. Program headers must fit in the first 4096 bytes and there may be at most sixteen.
-*   Initialization overlaps are allowed only when overlapping initialized destinations refer to identical file offsets. All zero-fill occurs before file initialization, so initialized bytes win over BSS overlaps.
-*   Snapshots contain initialized writable bytes only. AUTO requires 32 KiB of remaining heap capacity. Explicit ON overrides that preference but cannot override capacity or isolation. OFF preserves mutated initialized data across reset. Releasing an existing snapshot restores it once, then requires reload to enable preservation again.
+*   Initialization overlaps are allowed only when overlapping initialized destinations refer to identical file offsets. Final clearing skips the union of initialized destinations, so initialized bytes win over BSS overlaps.
+*   Reset support is fixed at load time. Automatic retention requires 32 KiB of heap capacity and a verified PMP layout; `load --no-reset` omits snapshots. Reset never releases storage or replans PMP. The first accepted DATA payload invalidates the old guest; loader buffers and planner workspace then use guest SRAM, with live buffers moved into the planned stack before segment initialization.
 *   The heap is planned to its capacity. brk changes logical allocation and zeroes growth without changing PMP entries during ordinary execution.
 *   Linux generic syscall numbers replace the original private numbers. Existing guest binaries must be rebuilt. RV32 time uses time64 clock_gettime and clock_nanosleep with CLOCK_MONOTONIC; unsupported calls return -ENOSYS.
-*   Arguments and environment live on the guest stack, backed by bounded monitor-owned configuration. Environment starts empty; run supplies the image name as argv[0]. Quoting has no expansion or command execution.
+*   Arguments live on the guest stack; envp points to an empty table. No environment configuration is retained. run supplies the image name as argv[0]. Quoting has no expansion or command execution.
 
 
 Milestones and validation
@@ -41,3 +41,13 @@ Final observed normal-stack high-water use was 2716 bytes with 8192 reserved. Fl
 Primary artifacts are build/test-flex-check.log, build/test-flex-hardware.log, build/test-flex-hardware-ram-retry.log, build/test-flex-ram-build.log, build/test-flex-flash.log, and build/flashed-image.sha256. Host framing tests also passed. An accidentally unscoped Ruff invocation inspected the pre-existing .venv and reported dependency-file lint; the repository's scoped checks passed and no dependency files changed.
 
 BOOTSEL programming used sudo -n picotool without changing host rules. Initial immediate programming attempts raced USB re-enumeration; waiting for picotool to discover the device resolved that timing. The final protected image was written and flash-verified. The board returns to that flash image after SRAM testing; no Git checkout, reset, commit, or other Git mutation was performed.
+
+
+Load-time reset and guest scratch validation (2026-11-11)
+-------------------------------------------------------
+
+Formatting, Ruff lint, ty, native ASan/UBSan checks, three host transport tests, and all nine emulator scenarios passed. Native coverage includes destinations overwriting initial buffers and planner workspace, shared file sources, BSS overlapping initialized content, and a prefix boundary crossed inside a packet. Startup checks verify arguments and empty envp. Reset-disabled loads reject restart; retained snapshots restore data without changing the memory/PMP plan.
+
+The protected flash image was programmed and flash-verified on the attached Pico 2. The complete hardware suite passed, including twelve fault probes, reset policy, register preservation, heap behavior, and suspension. Additional hardware checks confirmed cancellation before BEGIN and after BEGIN preserves the ready guest, while cancellation after the first accepted DATA block leaves EMPTY. The board was restored to hello.elf in READY state. Hardware suite output is in build/test-load-hardware.log.
+
+Observed flash static SRAM extent is 40040 bytes, down from 68456 bytes (28416 bytes removed). Observed normal-stack high-water use in this suite was 2456 bytes, with 8192 reserved. The flash and SRAM monitor reservations remain unchanged; the newly unused trusted SRAM is not yet added to the guest arena. Transport framing buffers remain monitor-owned to validate the first payload before guest invalidation.

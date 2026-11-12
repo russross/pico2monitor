@@ -36,12 +36,11 @@ void memory_map_step(void) {
                        (unsigned long)program.current_break, (unsigned long)p->stack_base,
                        (unsigned long)p->stack_top);
     } else if (current == image->segment_count + 2) {
-        static const char *const names[] = {"auto", "on", "off"};
-        console_printf("reset-data requested=%s effective=%s snapshot=%lu reserved=%lu%s\r\n",
+        static const char *const names[] = {"auto", "off"};
+        console_printf("reset-data requested=%s effective=%s snapshot=%lu reserved=%lu\r\n",
                        names[p->requested], p->snapshot ? "on" : "off",
                        (unsigned long)p->snapshot_size,
-                       (unsigned long)(GUEST_END - p->snapshot_base),
-                       program.release_snapshot ? " (release on reset)" : "");
+                       (unsigned long)(GUEST_END - p->snapshot_base));
         if (!p->snapshot && p->requested != SNAP_OFF)
             console_printf("reset-data disabled: insufficient usable memory/PMP headroom\r\n");
         if (p->heap_limit - p->heap_base < HEAP_RESERVE)

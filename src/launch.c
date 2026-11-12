@@ -4,60 +4,6 @@
 
 #define LAUNCH_BYTES 2048u
 #define LAUNCH_COUNT 32u
-static char environment[LAUNCH_BYTES], updated[LAUNCH_BYTES];
-static uint32_t environment_size, environment_count;
-
-static bool valid_name(const char *name) {
-    if (!*name)
-        return false;
-    for (const char *c = name; *c; ++c)
-        if (*c == '=' || (unsigned char)*c < 33 || (unsigned char)*c > 126)
-            return false;
-    return true;
-}
-
-/* Environment changes are transactional; a rejected edit retains all entries.
- * The monitor owns these strings even when guest code overwrites its stack. */
-const char *environment_set(const char *name, const char *value) {
-    if (!valid_name(name))
-        return "invalid environment name";
-    size_t name_size = strlen(name), used = 0;
-    uint32_t count = 0;
-    for (uint32_t offset = 0; offset < environment_size;) {
-        const char *entry = environment + offset;
-        size_t length = strlen(entry) + 1;
-        if (!(strncmp(entry, name, name_size) == 0 && entry[name_size] == '=')) {
-            memcpy(updated + used, entry, length);
-            used += length;
-            ++count;
-        }
-        offset += (uint32_t)length;
-    }
-    if (value) {
-        size_t length = name_size + strlen(value) + 2;
-        if (count == LAUNCH_COUNT || length > LAUNCH_BYTES - used)
-            return "environment limit exceeded";
-        memcpy(updated + used, name, name_size);
-        updated[used + name_size] = '=';
-        memcpy(updated + used + name_size + 1, value, strlen(value) + 1);
-        used += length;
-        ++count;
-    }
-    memcpy(environment, updated, used);
-    environment_size = (uint32_t)used;
-    environment_count = count;
-    return NULL;
-}
-
-void environment_print(void) {
-    for (uint32_t offset = 0; offset < environment_size;) {
-        uint32_t length = (uint32_t)strlen(environment + offset);
-        console_write(environment + offset, length);
-        console_write("\r\n", 2);
-        offset += length + 1;
-    }
-}
-
 /* Linux-style startup tables use guest pointers, never monitor pointers. The
  * complete request is sized before any guest byte or execution state changes. */
 const char *program_launch(unsigned argc, const char *const *argv) {
@@ -65,15 +11,15 @@ const char *program_launch(unsigned argc, const char *const *argv) {
         return "run requires a ready program; use reset first";
     if (argc >= LAUNCH_COUNT)
         return "argument limit exceeded";
-    uint32_t sizes = environment_size + (uint32_t)strlen(program.image.name) + 1;
+    uint32_t sizes = (uint32_t)strlen(program.image.name) + 1;
     for (unsigned i = 0; i < argc; ++i) {
         size_t length = strlen(argv[i]) + 1;
         if (length > LAUNCH_BYTES || sizes > LAUNCH_BYTES - length)
-            return "argument/environment string limit exceeded";
+            return "argument string limit exceeded";
         sizes += (uint32_t)length;
     }
     if (sizes > LAUNCH_BYTES)
-        return "argument/environment string limit exceeded";
+        return "argument string limit exceeded";
     uint32_t phdr = 0;
     for (uint32_t i = 0; i < program.image.segment_count; ++i) {
         const Segment *s = &program.image.segments[i];
@@ -81,7 +27,7 @@ const char *program_launch(unsigned argc, const char *const *argv) {
             phdr = s->address + program.image.phoff - s->offset;
     }
     uint32_t aux_words = phdr ? 12 : 6;
-    uint32_t words = 1 + argc + 2 + environment_count + 1 + aux_words;
+    uint32_t words = 1 + argc + 2 + 1 + aux_words;
     const MemoryPlan *p = &program.image.plan;
     uint32_t strings = p->stack_top - sizes;
     uint32_t sp = (strings - words * 4) & ~15u;
@@ -104,14 +50,6 @@ const char *program_launch(unsigned argc, const char *const *argv) {
     memcpy(physical(cursor), &word, 4);
     cursor += 4;
     uint32_t envp_address = cursor;
-    for (uint32_t offset = 0; offset < environment_size;) {
-        uint32_t length = (uint32_t)strlen(environment + offset) + 1;
-        memcpy(physical(cursor), &string_cursor, 4);
-        memcpy(physical(string_cursor), environment + offset, length);
-        cursor += 4;
-        offset += length;
-        string_cursor += length;
-    }
     memcpy(physical(cursor), &word, 4);
     cursor += 4;
     /* AT_PAGESZ describes the nominal userspace ABI unit, not an MMU mapping. */

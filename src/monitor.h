@@ -38,7 +38,6 @@ typedef struct {
     bool valid, reset_busy;
     uint32_t reset_cursor;
     uint32_t current_break;
-    bool release_snapshot;
     int32_t exit_status;
     const char *stop_reason;
     uint64_t cpu_us;
@@ -65,7 +64,6 @@ void program_step(void);
 void program_suspend(const char *reason);
 void program_after_trap(void);
 bool guest_range(uint32_t address, uint32_t size, bool writable);
-extern SnapshotPolicy snapshot_policy;
 const char *memory_plan_build(Image *image, SnapshotPolicy policy);
 bool memory_plan_verify(const Image *image);
 uint8_t memory_permissions(const MemoryPlan *plan, uint32_t address);
@@ -74,8 +72,6 @@ void memory_map_start(void);
 void memory_map_step(void);
 bool memory_map_busy(void);
 const char *program_launch(unsigned argc, const char *const *argv);
-const char *environment_set(const char *name, const char *value);
-void environment_print(void);
 const char *program_state_name(ProgramState state);
 
 void io_init(void);

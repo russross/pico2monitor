@@ -43,22 +43,19 @@ Upload and iterate
 
 Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The console and upload use separate USB CDC interfaces. Both utilities select stable device identities automatically; use `--port DEVICE` when needed. Console uses the interface ending in -if00; upload uses -if02. Ordinary terminal software also works with local echo disabled.
 
-A rejected header or memory plan preserves the previous image, including a suspended context. Once replacement begins, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
+Arming load or accepting BEGIN preserves the previous image. The first accepted nonempty DATA block invalidates it immediately. After that, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
 
 Zero exit is silent; nonzero exit prints its status. Faults show the cause, PC, and SP. The chip does not supply a reliable faulting address. Exited or faulted programs require reset before another run. Infinite loops can still be suspended by the monitor timer.
 
 
-Arguments and environment
--------------------------
+Arguments
+---------
 
-    setenv COURSE "assembly lab"
     run one "two words" ""
-    env
-    unsetenv COURSE
 
-The image's uploaded filename becomes argv[0]. Quoting supports single quotes, double quotes, and backslash escaping outside single quotes. There is no variable expansion, command substitution, or shell pipeline syntax. Environment starts empty and persists in monitor settings until changed or the monitor restarts.
+The image's uploaded filename becomes argv[0]. Quoting supports single quotes, double quotes, and backslash escaping outside single quotes. There is no variable expansion, command substitution, or shell pipeline syntax. The environment is always empty; envp points to a single NULL pointer.
 
-Limits are 32 arguments including argv[0], 32 environment entries, and 2048 combined bytes of argument/environment strings including NUL terminators. A command line may contain 2304 characters. A rejected launch leaves the program ready.
+Limits are 32 arguments including argv[0] and 2048 bytes of argument strings including NUL terminators. A command line may contain 2304 characters. A rejected launch leaves the program ready.
 
 At `_start`, sp is aligned to 16 bytes. Memory starting there contains:
 
@@ -100,18 +97,15 @@ A freestanding C runtime can use `tests/guest.h` and `tests/guest.c`. A general 
 Reset and memory pressure
 -------------------------
 
-    reset-data auto
-    reset-data on
-    reset-data off
+    load
+    load --no-reset
     map
 
-AUTO preserves original initialized writable bytes when enough memory remains for at least 32 KiB of heap capacity. ON preserves them whenever they fit, warns below that threshold, and is overridden when preservation cannot fit or be isolated. OFF avoids that storage. Settings apply to subsequent loads; for an existing snapshot they also determine retention or release at the next reset. AUTO can release a tight snapshot; ON cancels a pending release.
+By default, loading retains original initialized writable bytes for reset when the verified memory/PMP layout leaves at least 32 KiB of heap capacity. Otherwise reset support is automatically disabled. `load --no-reset` deliberately omits that storage for the upload. Reset policy and the stack/PMP layout remain fixed until the next upload.
 
 The map shows requested and effective policy, snapshot payload bytes, reserved bytes including alignment padding, and heap capacity. A stack-sized snapshot boundary is preferred because it produces better PMP mappings; a compact boundary is tried when needed to fit. There is no fixed text/data/rodata size limit independent of the available arena.
 
-With preservation enabled, reset restores initialized writable data and clears BSS, heap, stack, and transient padding. Immutable image contents remain intact. With preservation disabled, reset preserves initialized writable bytes as they currently stand and clears writable zero-fill and transient storage. Thus a modified global initializer can remain modified on the next run.
-
-Selecting OFF with an existing snapshot schedules reclamation: reset restores initialized data one final time, erases the protected copy, moves the stack upward, and enlarges heap capacity. Until that reset, selecting ON cancels release. After reclamation, enabling preservation requires reloading the ELF. Current mutated bytes cannot reconstruct the original file.
+With reset support, reset restores initialized writable data and clears BSS, heap, stack, and transient padding. Immutable image contents remain intact. Without reset support, reset is rejected; upload again to restart the program.
 
 
 Read the memory map
@@ -130,5 +124,5 @@ Troubleshooting
 *   Load rejected: inspect architecture, static linkage, physical destinations, program-header limits, conflicting initialization, and space for the stack.
 *   Unexpected fault: inspect PC/SP and effective PMP entries. An unsupported instruction, privileged CSR access, or device access also faults.
 *   Syscall returned an error: check the number, descriptor, pointer permissions, allocation bounds, and negative errno.
-*   Reset changed behavior: inspect effective reset-data policy, arguments, and environment. Initialized bytes persist without a snapshot.
+*   Reset changed behavior: inspect the effective reset policy and arguments. Reset requires retained reset support.
 *   Upload failed: read whether the previous image was preserved. Repeat the upload if replacement had started.

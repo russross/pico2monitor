@@ -109,8 +109,8 @@ typedef struct {
 
 static const CommandHelp commands[] = {
     {"help", "help [COMMAND]", "Show command help", "Show all commands or details for COMMAND."},
-    {"load", "load", "Receive an ELF program",
-     "Arm the upload port; send an ELF with ./pico-send."},
+    {"load", "load [--no-reset]", "Receive an ELF program",
+     "Arm the upload port; --no-reset omits reset storage for this load."},
     {"info", "info", "Show program and I/O status",
      "Show the loaded image, execution state, and I/O counters."},
     {"map", "map", "Show the memory map", "Show the guest memory map and permissions."},
@@ -120,17 +120,7 @@ static const CommandHelp commands[] = {
     {"resume", "resume", "Resume a suspended program",
      "Continue from the saved program state and pending system call."},
     {"reset", "reset", "Reset the loaded program",
-     "Prepare the program to run again. Initialized writable data is restored only if a snapshot "
-     "was preserved."},
-    {"env", "env", "List guest environment",
-     "Show environment variables supplied to the next run."},
-    {"setenv", "setenv NAME VALUE", "Set a guest environment variable",
-     "Set NAME to VALUE for subsequent runs. Quote values containing spaces."},
-    {"unsetenv", "unsetenv NAME", "Remove a guest environment variable",
-     "Remove NAME from the environment for subsequent runs."},
-    {"reset-data", "reset-data auto|on|off", "Set snapshot policy",
-     "Set whether initialized writable data is preserved for reset. Some changes require reloading "
-     "the program."},
+     "Restore the program for another run; requires reset support retained at load time."},
     {"bootsel", "bootsel", "Reboot into USB boot mode",
      "Restart the board in BOOTSEL mode for firmware upload."},
     {"quit", "quit", "Detach pico-console", "Close the pico-console connection to the board."},
@@ -163,8 +153,8 @@ static void execute(void) {
         return;
     }
     const char *error = NULL;
-    if (strcmp(line, "run") != 0 && strcmp(line, "setenv") != 0 && strcmp(line, "unsetenv") != 0 &&
-        strcmp(line, "reset-data") != 0 && strcmp(line, "help") != 0 && argc != 1) {
+    if (strcmp(line, "run") != 0 && strcmp(line, "load") != 0 && strcmp(line, "help") != 0 &&
+        argc != 1) {
         console_printf("unexpected command arguments\r\n");
         shell_prompt();
         return;
@@ -176,41 +166,20 @@ static void execute(void) {
             help(argc == 2 ? args[1] : NULL);
     } else if (strcmp(line, "map") == 0)
         memory_map_start();
-    else if (strcmp(line, "env") == 0)
-        environment_print();
-    else if (strcmp(line, "setenv") == 0)
-        error = argc == 3 ? environment_set(args[1], args[2]) : "usage: setenv NAME VALUE";
-    else if (strcmp(line, "unsetenv") == 0)
-        error = argc == 2 ? environment_set(args[1], NULL) : "usage: unsetenv NAME";
-    else if (strcmp(line, "reset-data") == 0) {
-        if (argc != 2 ||
-            (strcmp(args[1], "auto") && strcmp(args[1], "on") && strcmp(args[1], "off")))
-            error = "usage: reset-data auto|on|off";
-        else {
-            snapshot_policy = !strcmp(args[1], "auto") ? SNAP_AUTO
-                              : !strcmp(args[1], "on") ? SNAP_ON
-                                                       : SNAP_OFF;
-            if (program.valid && program.image.plan.snapshot) {
-                program.image.plan.requested = snapshot_policy;
-                program.release_snapshot =
-                    snapshot_policy == SNAP_OFF ||
-                    (snapshot_policy == SNAP_AUTO &&
-                     program.image.plan.heap_limit - program.image.plan.heap_base < HEAP_RESERVE);
-                console_printf("setting saved; snapshot %s on next reset\r\n",
-                               program.release_snapshot ? "released" : "retained");
-            } else if (program.valid && snapshot_policy != SNAP_OFF)
-                console_printf("setting saved; reload to preserve initialized writable data\r\n");
-            else
-                console_printf("setting saved for next load\r\n");
-        }
-    } else if (strcmp(line, "info") == 0)
+    else if (strcmp(line, "info") == 0)
         info();
     else if (strcmp(line, "load") == 0) {
-        transfer_arm();
-        return;
+        if (argc > 2 || (argc == 2 && strcmp(args[1], "--no-reset")))
+            error = "usage: load [--no-reset]";
+        else {
+            transfer_arm(argc == 1);
+            return;
+        }
     } else if (strcmp(line, "reset") == 0) {
         if (!program.valid)
             console_printf("no loaded program\r\n");
+        else if (!program.image.plan.snapshot)
+            error = "reset unavailable for this load; upload again";
         else {
             program_reset();
             return;

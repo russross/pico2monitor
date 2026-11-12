@@ -5,17 +5,17 @@
 typedef enum {
     LOAD_IDLE,
     LOAD_HEADERS,
-    LOAD_CLEAR,
     LOAD_STREAM,
     LOAD_DISCARD,
+    LOAD_CLEAR,
     LOAD_SNAPSHOT,
     LOAD_DONE
 } LoadState;
 typedef struct {
     LoadState state;
     Image image;
-    uint32_t cursor, work_cursor, pending_size;
-    uint8_t prefix[ELF_PREFIX_SIZE], pending[1024];
+    uint32_t cursor, work_cursor;
+    uint8_t *prefix, *upload;
     const char *error;
     bool destructive;
 } Loader;

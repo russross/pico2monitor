@@ -182,7 +182,7 @@ static void load_and_reset(const uint8_t *file, uint32_t size) {
     for (uint32_t i = 0; i < STACK_SIZE; ++i)
         assert(physical(program.image.plan.stack_base)[i] == 0);
 
-    /* Rejected plans preserve even a suspended register context and initialized data. */
+    /* BEGIN and cancellation preserve the guest; the first payload invalidates it. */
     program.state = STOPPED;
     program.frame.x[5] = 0x87654321;
     Program old = program;
@@ -190,12 +190,16 @@ static void load_and_reset(const uint8_t *file, uint32_t size) {
     memcpy(prefix, file, sizeof(prefix));
     prefix[4] = 2;
     loader_begin(size, 0, "bad.elf");
+    assert(!memcmp(&old, &program, sizeof(program)));
+    loader_abort("cancelled before data");
+    assert(!memcmp(&old, &program, sizeof(program)));
+    loader_begin(size, 0, "bad.elf");
     loader_feed(0, prefix, 1024);
+    assert(loader.destructive && !program.valid);
     loader_feed(1024, prefix + 1024, 1024);
     loader_feed(2048, prefix + 2048, 1024);
     loader_feed(3072, prefix + 3072, 1024);
-    assert(loader.error && !loader.destructive);
-    assert(memcmp(&old, &program, sizeof(program)) == 0);
+    assert(loader.error && loader.destructive && !program.valid);
     loader_begin(size, 0, "interrupted.elf");
     for (uint32_t i = 0; i < 4096; i += 1024)
         loader_feed(i, file + i, 1024);
@@ -260,13 +264,12 @@ static void flexible_checks(void) {
     assert(!guest_range(program.image.plan.snapshot_base, 1, false));
 
     const char *args[] = {"one", "two words", ""};
-    assert(!environment_set("COURSE", "assembly lab"));
-    assert(environment_set("BAD=NAME", "x"));
     assert(!program_launch(3, args));
     uint32_t sp = program.frame.x[2];
     assert(!(sp & 15) && read_le32(physical(sp)) == 4);
     assert(!strcmp((char *)physical(read_le32(physical(sp + 12))), "two words"));
-    assert(!strcmp((char *)physical(read_le32(physical(sp + 24))), "COURSE=assembly lab"));
+    assert(read_le32(physical(sp + 24)) == 0);
+    assert(program.frame.x[12] == sp + 24);
     uint32_t base = program.current_break;
     program.frame.cause = 8;
     program.frame.x[17] = 214;
@@ -317,35 +320,68 @@ static void flexible_checks(void) {
     assert(!memcmp(guest_output, physical(base), 700));
     guest_output_credit = SIZE_MAX;
 
-    /* Reclamation restores initialized data once, then permanently releases the
-     * protected copy. Later restarts preserve mutations but still clear BSS. */
+    /* Reset retains the same layout and restores initialized writable bytes. */
     *physical(TEXT_BASE + 128) = 0xaa;
     *physical(TEXT_BASE + 600) = 0xbb;
-    uint32_t old_limit = program.image.plan.heap_limit;
-    program.release_snapshot = true;
+    MemoryPlan original = program.image.plan;
     program_reset();
     for (unsigned i = 0; program.reset_busy && i < 1000; ++i)
         program_step();
-    assert(!program.reset_busy && !program.image.plan.snapshot);
-    assert(program.image.plan.heap_limit > old_limit);
+    assert(!program.reset_busy && !memcmp(&original, &program.image.plan, sizeof(original)));
     assert(*physical(TEXT_BASE + 128) == file[128] && !*physical(TEXT_BASE + 600));
-    *physical(TEXT_BASE + 128) = 0xcc;
-    *physical(TEXT_BASE + 600) = 0xdd;
+
+    /* Explicitly disabling reset permits a run but never a restart. */
+    loader_begin(sizeof(file), 0, "no-reset.elf");
+    loader.image.plan.requested = SNAP_OFF;
+    feed(file, sizeof(file));
+    loader_end();
+    settle_loader();
+    assert(!loader.error && !program.image.plan.snapshot);
+    assert(!program_launch(0, NULL));
+    program.state = EXITED;
     program_reset();
-    for (unsigned i = 0; program.reset_busy && i < 1000; ++i)
-        program_step();
-    assert(*physical(TEXT_BASE + 128) == 0xcc && !*physical(TEXT_BASE + 600));
+    assert(!program.reset_busy && program.state == EXITED);
+
+    /* Prefix destinations overwrite the initial buffers and planning workspace.
+     * Shared file bytes and overlapping BSS must survive final clearing. */
+    uint8_t shared[8192];
+    for (unsigned i = 0; i < sizeof(shared); ++i)
+        shared[i] = (uint8_t)i;
+    memcpy(shared, file, 84);
+    shared[44] = 2;
+    write_le32(shared + 24, GUEST_BASE + 128);
+    write_le32(shared + 60, GUEST_BASE);
+    write_le32(shared + 68, sizeof(shared));
+    write_le32(shared + 72, 16384);
+    memcpy(shared + 84, shared + 52, 32);
+    write_le32(shared + 92, GUEST_BASE + 8192);
+    loader_begin(sizeof(shared), 0, "scratch.elf");
+    uint32_t cursor = 0;
+    while (cursor < sizeof(shared)) {
+        uint32_t count = sizeof(shared) - cursor;
+        if (count > 997)
+            count = 997;
+        loader_feed(cursor, shared + cursor, count);
+        cursor += count;
+    }
+    loader_end();
+    settle_loader();
+    assert(!loader.error && program.state == READY);
+    assert(!memcmp(physical(GUEST_BASE), shared, sizeof(shared)));
+    assert(!memcmp(physical(GUEST_BASE + 8192), shared, sizeof(shared)));
+    for (uint32_t address = GUEST_BASE + 16384; address < program.image.plan.snapshot_base;
+         ++address)
+        assert(!*physical(address));
 
     Image large = {.segment_count = 1};
     large.segments[0] = (Segment){
         .address = TEXT_BASE, .memory_size = 168 * 1024, .file_size = 168 * 1024, .permissions = 7};
     assert(!memory_plan_build(&large, SNAP_AUTO) && !large.plan.snapshot);
-    assert(!memory_plan_build(&large, SNAP_ON) && large.plan.snapshot);
+    assert(!memory_plan_build(&large, SNAP_OFF) && !large.plan.snapshot);
     large.segments[0].memory_size = large.segments[0].file_size = 210 * 1024;
-    assert(!memory_plan_build(&large, SNAP_ON) && !large.plan.snapshot);
+    assert(!memory_plan_build(&large, SNAP_AUTO) && !large.plan.snapshot);
     large.plan.regions[0] = (PmpRegion){0x20000000, 0x80000, 7};
     assert(!memory_plan_verify(&large));
-    assert(!environment_set("COURSE", NULL));
 }
 
 uint64_t memory_test_solve(Image *image, uint32_t base, uint32_t size, unsigned budget);
@@ -429,7 +465,9 @@ static WireFrame request(const WireFrame *frame) {
 }
 
 static void transfer_checks(const uint8_t *file, uint32_t size) {
-    transfer_arm();
+    Program previous = program;
+    uint32_t previous_crc = crc32_update(0, physical(GUEST_BASE), GUEST_END - GUEST_BASE);
+    transfer_arm(true);
     WireFrame response = request(NULL);
     assert(response.type == WIRE_READY);
     uint64_t session = response.session;
@@ -440,6 +478,12 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     frame.payload[9] = 'x';
     response = request(&frame);
     assert(response.type == WIRE_ACK && response.sequence == 1);
+    assert(!memcmp(&previous, &program, sizeof(program)));
+    frame = (WireFrame){.type = WIRE_DATA, .session = session, .sequence = 1};
+    response = request(&frame);
+    assert(response.type == WIRE_NAK);
+    assert(!memcmp(&previous, &program, sizeof(program)));
+    assert(previous_crc == crc32_update(0, physical(GUEST_BASE), GUEST_END - GUEST_BASE));
     uint32_t offset = 0, sequence = 1;
     while (offset < size) {
         uint32_t count = size - offset;
@@ -453,6 +497,7 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
         memcpy(frame.payload, file + offset, count);
         response = request(&frame);
         assert(response.type == WIRE_ACK && response.offset == offset + count);
+        assert(!program.valid && program.state == EMPTY);
         if (sequence == 6) {
             response = request(&frame);
             assert(response.type == WIRE_ACK && response.offset == offset + count);
@@ -465,7 +510,7 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     assert(response.type == WIRE_RESULT && response.payload[0] == 0 && program.state == READY);
     response = request(&frame);
     assert(response.type == WIRE_RESULT && response.payload[0] == 0);
-    transfer_arm();
+    transfer_arm(true);
     response = request(NULL);
     frame = (WireFrame){.type = WIRE_ABORT, .session = response.session};
     response = request(&frame);

@@ -2,8 +2,6 @@
 
 #include <string.h>
 
-SnapshotPolicy snapshot_policy = SNAP_AUTO;
-
 /* Required access is separate from debugging preferences. Trusted bytes never
  * receive a fallback grant, even when an enclosing NAPOT region crosses them. */
 typedef enum { TRUSTED, UNUSED, GUARD, TEXT, RODATA, WRITABLE } Role;
@@ -19,7 +17,10 @@ typedef struct {
 typedef struct {
     Choice best[5][8], left[5][8];
 } Workspace;
-static Workspace workspace[15];
+/* Planning runs only before segment initialization, using disposable guest SRAM. */
+#define workspace ((Workspace *)physical(GUEST_BASE + 8192))
+_Static_assert(8192 + sizeof(Workspace) * 15 <= GUEST_END - GUEST_BASE,
+               "planning workspace must fit guest SRAM");
 static const uint8_t modes[] = {0, 4, 5, 6, 7};
 static const Image *solving;
 
@@ -287,8 +288,7 @@ const char *memory_plan_build(Image *image, SnapshotPolicy policy) {
         const uint32_t alignments[] = {STACK_SIZE, 32};
         for (unsigned i = 0; i < 2; ++i) {
             const char *error = layout(image, true, alignments[i]);
-            if (!error && (policy == SNAP_ON ||
-                           image->plan.heap_limit - image->plan.heap_base >= HEAP_RESERVE))
+            if (!error && image->plan.heap_limit - image->plan.heap_base >= HEAP_RESERVE)
                 return NULL;
         }
     }

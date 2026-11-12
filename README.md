@@ -17,7 +17,7 @@ Build and use
 
 Both channels use the same USB cable. Utilities prefer stable serial identities; `--port DEVICE` selects a particular board. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
 
-`build/exec.elf` demonstrates quoted arguments, environment variables, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20020000`. Older hello/echo/loop/register examples and protection probes retain the fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
+`build/exec.elf` demonstrates quoted arguments, empty envp, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20020000`. Older hello/echo/loop/register examples and protection probes retain the fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
 
 
 Memory and shell
@@ -25,13 +25,13 @@ Memory and shell
 
 Flash firmware reserves 96 KiB of low SRAM for monitor storage and an 8 KiB normal stack. SRAM-executing firmware reserves 128 KiB. Guest load segments, heap, stack, and optional protected reset data share the remainder of main SRAM through 0x20080000. Final scratch banks remain trusted. Linker assertions, measured stack high-water output, and compiler stack-usage reports support the budget.
 
-The shell provides `load`, `run [args]`, `reset`, `resume`, `info`, `map`, `env`, `setenv NAME VALUE`, `unsetenv NAME`, `reset-data auto|on|off`, `help [COMMAND]`, `quit`, and `bootsel`.
+The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `info`, `map`, `help [COMMAND]`, `quit`, and `bootsel`.
 
-AUTO preserves initialized writable data when sufficient heap headroom remains. Oversized programs automatically drop preservation. OFF on an existing snapshot schedules its release at the next reset: data is restored one final time, then the protected copy is erased and reclaimed. Reload is required to re-enable preservation. Without preservation, initialized writable contents persist across reset; BSS and runtime storage are cleared.
+Loading retains initialized writable data for reset when the verified layout leaves at least 32 KiB of heap capacity. Otherwise reset support is automatically disabled. `load --no-reset` omits reset storage for that upload. Reset requires retained support; its memory/PMP layout stays fixed until reload. Arguments remain supported; the environment is always empty.
 
 PMP entries adapt to each program. Required permissions take precedence over optional guards and write/execute restrictions. `map` reports the effective first-match entries, heap/break, stack, and snapshot cost. Guest code cannot access peripherals, ROM, monitor memory, flash, or protected snapshot storage. This is a syscall environment, not Pico SDK firmware hosting.
 
-Early load rejection preserves the previous program. Failure after replacement starts leaves no runnable partial image. Power loss or monitor reboot loses the SRAM guest. `bootsel` returns to the ROM programmer; watchdog expiry supplies monitor recovery.
+Arming load and accepting BEGIN preserve the previous program. The first accepted nonempty DATA block invalidates it; subsequent failure leaves no runnable image. Power loss or monitor reboot loses the SRAM guest. `bootsel` returns to the ROM programmer; watchdog expiry supplies monitor recovery.
 
 
 Checks and project notes

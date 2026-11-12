@@ -15,7 +15,7 @@ static struct {
     TransferState state;
     uint64_t session, deadline, ready_at;
     uint32_t sequence, offset, file_size, expected_crc, running_crc, last_crc;
-    bool previous_connected, ack_pending, overflow;
+    bool previous_connected, ack_pending, overflow, reset;
     size_t input_size, output_size, output_cursor;
     uint8_t input[WIRE_LIMIT], output[WIRE_LIMIT];
     WireFrame frame, result;
@@ -67,10 +67,11 @@ static void result(void) {
     shell_prompt();
 }
 
-void transfer_arm(void) {
+void transfer_arm(bool reset) {
     static uint32_t generation;
     memset(&transfer, 0, sizeof(transfer));
     transfer.state = TRANSFER_ARMED;
+    transfer.reset = reset;
     transfer.session = (monitor_time_us() << 16) ^ ++generation;
     transfer.deadline = monitor_time_us() + UINT64_C(30000000);
     transfer.previous_connected = upload_connected();
@@ -100,6 +101,7 @@ static void begin(const WireFrame *frame) {
         name[i] = c >= 32 && c < 127 ? (char)c : '?';
     }
     loader_begin(size, crc, name);
+    loader.image.plan.requested = transfer.reset ? SNAP_AUTO : SNAP_OFF;
     if (size < 52 || size > ELF_FILE_LIMIT) {
         loader_abort("file size outside ELF limits");
         result();

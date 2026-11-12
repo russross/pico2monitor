@@ -42,8 +42,8 @@ class Hardware:
         self.console.write(text.encode() + b"\r")
         return self.until(b"pico> ")
 
-    def load(self, name: str) -> None:
-        self.console.write(b"load\r")
+    def load(self, name: str, *, reset: bool = True) -> None:
+        self.console.write(b"load\r" if reset else b"load --no-reset\r")
         self.until(b"waiting for ELF")
         send_file(Path("build") / name, self.upload)
         self.until(b"pico> ")
@@ -59,7 +59,7 @@ def run(board: Hardware) -> None:
     require(b"U-mode guests" in banner and b"EMULATOR" not in banner, "not the protected monitor")
     print(banner.decode(errors="replace"), end="", flush=True)
     check_exec(board)
-    print("default-linker ELF, args/env, brk, and snapshot lifecycle: passed", flush=True)
+    print("default-linker ELF, arguments, brk, and load-time reset policy: passed", flush=True)
     board.load("hello.elf")
     for attempt in range(2):
         if attempt:

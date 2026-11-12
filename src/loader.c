@@ -41,11 +41,21 @@ void loader_feed(uint32_t offset, const uint8_t *bytes, uint32_t count) {
         loader.cursor += count;
         return;
     }
-    if (offset != loader.cursor || count > 1024 ||
+    if (offset != loader.cursor || !count || count > 1024 ||
         !range_contains(0, loader.image.file_size, offset, count)) {
         loader_abort("invalid loader stream position");
         return;
     }
+    /* The first accepted payload owns the arena. Arming and BEGIN alone never
+     * disturb the old program or its suspended execution context. */
+    if (!loader.destructive) {
+        program_forget();
+        loader.destructive = true;
+        loader.prefix = physical(GUEST_BASE);
+        loader.upload = loader.prefix + ELF_PREFIX_SIZE;
+        console_printf("replacing previous SRAM image\r\n");
+    }
+    memcpy(loader.upload, bytes, count);
     loader.cursor += count;
     if (loader.state == LOAD_HEADERS) {
         uint32_t target =
@@ -53,7 +63,7 @@ void loader_feed(uint32_t offset, const uint8_t *bytes, uint32_t count) {
         uint32_t prefix = target - offset;
         if (prefix > count)
             prefix = count;
-        memcpy(loader.prefix + offset, bytes, prefix);
+        memcpy(loader.prefix + offset, loader.upload, prefix);
         if (offset + prefix < target)
             return;
         loader.error = elf_validate(loader.prefix, loader.image.file_size, &loader.image);
@@ -62,29 +72,53 @@ void loader_feed(uint32_t offset, const uint8_t *bytes, uint32_t count) {
             return;
         }
 
-        /* Only a fully verified layout can replace the suspended image. Clear
-         * the whole guest arena so inaccessible padding cannot retain old data. */
-        program_forget();
-        loader.destructive = true;
-        loader.work_cursor = GUEST_BASE;
-        loader.state = LOAD_CLEAR;
-        loader.pending_size = count - prefix;
-        memcpy(loader.pending, bytes + prefix, loader.pending_size);
-        console_printf("replacing previous SRAM image\r\n");
+        /* Move both live buffers as one overlap-safe block. The planner's
+         * workspace is dead, and every segment ends below the selected stack. */
+        uint8_t *buffers = physical(loader.image.plan.stack_base);
+        memmove(buffers, loader.prefix, ELF_PREFIX_SIZE + 1024);
+        loader.prefix = buffers;
+        loader.upload = buffers + ELF_PREFIX_SIZE;
+        loader.state = LOAD_STREAM;
+        copy_intersections(0, loader.prefix, target);
+        copy_intersections(target, loader.upload + prefix, count - prefix);
     } else if (loader.state == LOAD_STREAM)
-        copy_intersections(offset, bytes, count);
+        copy_intersections(offset, loader.upload, count);
+}
+
+/* Clearing preserves the union of initialized destinations, including where
+ * one segment's BSS overlaps another segment's file-backed content. */
+static void clear_chunk(void) {
+    uint32_t end = loader.work_cursor + 1024;
+    if (end > GUEST_END)
+        end = GUEST_END;
+    for (uint32_t address = loader.work_cursor; address < end; ++address) {
+        bool initialized = false;
+        for (uint32_t i = 0; i < loader.image.segment_count; ++i) {
+            const Segment *s = &loader.image.segments[i];
+            initialized = initialized || range_contains(s->address, s->file_size, address, 1);
+        }
+        if (!initialized)
+            *physical(address) = 0;
+    }
+    loader.work_cursor = end;
+}
+
+static void finish(void) {
+    monitor_fence_i();
+    program_install(&loader.image);
+    loader.state = LOAD_DONE;
 }
 
 void loader_step(void) {
     if (loader.state == LOAD_CLEAR) {
-        memset(physical(loader.work_cursor), 0, 1024);
-        loader.work_cursor += 1024;
+        clear_chunk();
         if (loader.work_cursor == GUEST_END) {
-            loader.state = LOAD_STREAM;
-            uint32_t prefix =
-                loader.image.file_size < ELF_PREFIX_SIZE ? loader.image.file_size : ELF_PREFIX_SIZE;
-            copy_intersections(0, loader.prefix, prefix);
-            copy_intersections(prefix, loader.pending, loader.pending_size);
+            loader.prefix = loader.upload = NULL;
+            if (loader.image.plan.snapshot) {
+                loader.state = LOAD_SNAPSHOT;
+                loader.work_cursor = 0;
+            } else
+                finish();
         }
     } else if (loader.state == LOAD_SNAPSHOT) {
         uint32_t position = loader.work_cursor;
@@ -104,9 +138,7 @@ void loader_step(void) {
             loader.work_cursor += count;
             return;
         }
-        monitor_fence_i();
-        program_install(&loader.image);
-        loader.state = LOAD_DONE;
+        finish();
     }
 }
 
@@ -128,12 +160,8 @@ void loader_end(void) {
             loader_abort("incomplete ELF segment");
     if (loader.error)
         loader.state = LOAD_DONE;
-    else if (loader.image.plan.snapshot) {
-        loader.state = LOAD_SNAPSHOT;
-        loader.work_cursor = 0;
-    } else {
-        monitor_fence_i();
-        program_install(&loader.image);
-        loader.state = LOAD_DONE;
+    else {
+        loader.state = LOAD_CLEAR;
+        loader.work_cursor = GUEST_BASE;
     }
 }

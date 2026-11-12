@@ -38,7 +38,7 @@ void program_install(const Image *image) {
 }
 
 void program_reset(void) {
-    if (!program.valid || program.reset_busy)
+    if (!program.valid || program.reset_busy || !program.image.plan.snapshot)
         return;
     pmp_disable();
     program.reset_busy = true;
@@ -207,32 +207,12 @@ void program_step(void) {
     if (program.reset_busy) {
         const Image *image = &program.image;
         const MemoryPlan *p = &image->plan;
-        if (program.reset_cursor >= GUEST_END - GUEST_BASE) {
-            uint32_t cleared = program.reset_cursor - (GUEST_END - GUEST_BASE);
-            uint32_t count = GUEST_END - p->snapshot_base - cleared;
-            if (count > 1024)
-                count = 1024;
-            if (count)
-                memset(physical(p->snapshot_base + cleared), 0, count);
-            program.reset_cursor += count;
-            if (cleared + count < GUEST_END - p->snapshot_base)
-                return;
-            const char *error = memory_plan_build(&program.image, SNAP_OFF);
-            if (error)
-                monitor_panic(error);
-            program.release_snapshot = false;
-            program.reset_busy = false;
-            initial_frame();
-            memory_map_start();
-            shell_prompt();
-            return;
-        }
         uint32_t begin = GUEST_BASE + program.reset_cursor;
         uint32_t end = begin + 1024;
         if (end > GUEST_END)
             end = GUEST_END;
-        /* Initialized overlaps win over zero-fill. An absent snapshot preserves
-         * initialized bytes, while every restart clears BSS and transient SRAM. */
+        /* Initialized overlaps win over zero-fill. Restarts restore writable
+         * initializers while clearing BSS and transient SRAM. */
         for (uint32_t a = begin; a < end; ++a) {
             if (a >= p->snapshot_base)
                 continue;
@@ -264,8 +244,6 @@ void program_step(void) {
         }
         program.reset_cursor += end - begin;
         if (end == GUEST_END) {
-            if (program.release_snapshot)
-                return;
             program.reset_busy = false;
             initial_frame();
             shell_prompt();

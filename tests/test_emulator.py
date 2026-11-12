@@ -65,8 +65,8 @@ class Emulator:
         self.console.write(text.encode() + b"\r")
         return self.until(b"pico> ")
 
-    def load(self, name: str) -> None:
-        self.console.write(b"load\r")
+    def load(self, name: str, *, reset: bool = True) -> None:
+        self.console.write(b"load\r" if reset else b"load --no-reset\r")
         self.until(b"waiting for ELF")
         send_file(ROOT / "build" / name, self.upload)
         output = self.until(b"pico> ")
@@ -174,10 +174,6 @@ class MonitorTests(unittest.TestCase):
             "run",
             "resume",
             "reset",
-            "env",
-            "setenv",
-            "unsetenv",
-            "reset-data",
             "bootsel",
             "quit",
         ):
@@ -210,7 +206,7 @@ class MonitorTests(unittest.TestCase):
         self.assertIn(b"register frame OK", output)
         self.assertNotIn(b"exit:", output)
 
-    def test_header_failure_preserves_image(self) -> None:
+    def test_header_failure_invalidates_image(self) -> None:
         e = self.emulator
         e.load("hello.elf")
         data = bytearray((ROOT / "build/hello.elf").read_bytes())
@@ -220,10 +216,11 @@ class MonitorTests(unittest.TestCase):
             bad.write_bytes(data)
             e.console.write(b"load\r")
             e.until(b"waiting for ELF")
-            with self.assertRaisesRegex(UploadError, "previous image preserved"):
+            with self.assertRaisesRegex(UploadError, "no runnable image"):
                 send_file(bad, e.upload, preflight=False)
         e.until(b"pico> ")
-        self.assertIn(b"state: ready", e.command("info"))
+        self.assertIn(b"state: empty", e.command("info"))
+        e.load("hello.elf")
         self.assertIn(b"syscalls and reset state OK", e.command("run"))
 
     def test_crc_failure_and_recovery(self) -> None:

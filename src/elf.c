@@ -17,7 +17,7 @@ const char *elf_validate(const uint8_t *p, uint32_t size, Image *image) {
     if (read_le16(p + 40) != 52 || read_le16(p + 42) != 32 || (read_le32(p + 36) & ~1u))
         return "unsupported ELF headers or ABI flags";
 
-    /* Header parsing finishes before SRAM replacement. Metadata may share file
+    /* Header parsing finishes before segment initialization. Metadata may share file
      * bytes with a load segment; the streaming loader replays the saved prefix. */
     uint32_t table = read_le32(p + 28), count = read_le16(p + 44);
     uint32_t available = size < ELF_PREFIX_SIZE ? size : ELF_PREFIX_SIZE;
@@ -78,5 +78,5 @@ const char *elf_validate(const uint8_t *p, uint32_t size, Image *image) {
     }
     if (!entry)
         return "entry is not in initialized executable text";
-    return memory_plan_build(image, snapshot_policy);
+    return memory_plan_build(image, image->plan.requested);
 }
