@@ -103,18 +103,18 @@ def main() -> int:
             ).read()
             if (
                 hashlib.sha256(data).hexdigest()
-                != "45682659e17cb0b241dbdaac0e9c9731f9d1c89da0c89387395cb318e2ba9971"
+                != "44731efa8dfcb06a3c0395ed0b2058b82d8eb10fbbaf6b4b74121d7be9c7a170"
             ):
                 raise RuntimeError(
                     "rp2350js rolling release changed; audit and update its pinned checksum"
                 )
             header.write_bytes(data)
         checksum = hashlib.sha256(header.read_bytes()).hexdigest()
-        if checksum == "45682659e17cb0b241dbdaac0e9c9731f9d1c89da0c89387395cb318e2ba9971":
+        if checksum == "44731efa8dfcb06a3c0395ed0b2058b82d8eb10fbbaf6b4b74121d7be9c7a170":
             subprocess.run(
                 ["patch", "-p1", "-i", str(ROOT / "scripts/rp2350js-c.patch")], cwd=ROOT, check=True
             )
-        elif checksum != "03c72886dbebdfb630f2cbe25ae5a42efbb9cd72f7c35c3ba22e4165e81de8c7":
+        elif checksum != "acac377069a63640131e2a49345c57037ccf5288f7999aaa130ee159ccd5fd00":
             raise RuntimeError("emulator header differs from the pinned release and ORC.B patch")
         return 0
     except (OSError, RuntimeError, tarfile.TarError, subprocess.CalledProcessError) as error:
