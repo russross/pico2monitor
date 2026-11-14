@@ -35,17 +35,18 @@ Multiple load segments, arbitrary ordering, and RWX segments are allowed. Overla
 Upload and iterate
 ------------------
 
-1. Connect with `./dist/pico-console`. Ctrl-D at the monitor prompt, Ctrl-], and `quit` at the monitor prompt detach. Ctrl-C and Escape are sent to the board.
-2. Type `load` at the monitor prompt.
-3. In another host terminal, run `./dist/pico-send hello.elf`.
-4. Inspect the automatic memory map and type `run`, optionally followed by arguments.
-5. Use Ctrl-C/Escape to suspend, `resume` to continue, or `reset` then `run` to restart.
+1. Run `./dist/pico hello.elf` in an interactive terminal. It connects, suspends any running guest, issues `load`, uploads the file, and leaves the console open.
+2. Inspect the automatic memory map and type `run`, optionally followed by arguments.
+3. Use Ctrl-C/Escape to suspend, `resume` to continue, or `reset` then `run` to restart a suspended guest. After exit, `run` automatically resets when supported.
+4. Use Ctrl-D or `quit` at the monitor prompt, or Ctrl-] in the host terminal, to detach. Ctrl-C and Escape are sent to the board.
 
-Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The console and upload use separate USB CDC interfaces. Both utilities select stable device identities automatically; use `--port DEVICE` when needed. Console uses the interface ending in -if00; upload uses -if02. Ordinary terminal software also works with local echo disabled.
+`./dist/pico` connects without uploading. To upload separately, type `load` (or `load --no-reset`) in an existing console, then run `./dist/pico --send hello.elf` in another terminal. The single script uses only Python's standard library and Unix serial interfaces; no Pico SDK is needed on the host.
+
+Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The console and upload use separate USB CDC interfaces. The script selects stable device identities automatically; use `--console-port DEVICE` and `--upload-port DEVICE` when needed. When multiple boards are connected, specify both devices for the same board. Console uses the interface ending in -if00; upload uses -if02. Ordinary terminal software also works with local echo disabled.
 
 Arming load or accepting BEGIN preserves the previous image. The first accepted nonempty DATA block invalidates it immediately. After that, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
 
-The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. Exited or faulted programs require reset before another run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
+The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. For exited programs, run automatically resets before starting again when reset support is retained. Suspended or faulted programs require explicit reset before a fresh run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
 
 
 Arguments

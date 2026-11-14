@@ -5,10 +5,12 @@ from __future__ import annotations
 import binascii
 import json
 import os
+import pty
 import select
 import struct
 import subprocess
 import tempfile
+import termios
 import time
 import unittest
 from collections.abc import Generator
@@ -18,7 +20,7 @@ from typing import TextIO
 
 from test_exec import check_exec, check_threads
 
-from pico_send import Frame, Kind, SerialPort, UploadError, exchange, send_file
+from pico import Frame, Kind, SerialPort, UploadError, exchange, send_file
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -107,6 +109,96 @@ class MonitorTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.emulator = self.enterContext(running_emulator())
+
+    def test_combined_host_command(self) -> None:
+        e = self.emulator
+        e.load("loop.elf")
+        e.console.write(b"run\r")
+        e.until(b"busy loop: no syscalls; Ctrl-C must still work\r\n")
+        self.check_host_console([str(ROOT / "build/hello.elf")], b"loaded: hello.elf; ready")
+
+    def test_console_only_host_command(self) -> None:
+        self.check_host_console([], b"state: empty", command=b"info\r")
+
+    def check_host_console(
+        self, arguments: list[str], marker: bytes, *, command: bytes | None = None
+    ) -> None:
+        # A real terminal exercises raw input, output forwarding, and restoration
+        # while the emulator supplies both monitor CDC interfaces.
+        e = self.emulator
+        master, slave = pty.openpty()
+        attributes = termios.tcgetattr(slave)
+        try:
+            with subprocess.Popen(
+                [
+                    str(ROOT / "src/pico.py"),
+                    *arguments,
+                    "--console-port",
+                    os.ttyname(e.console.fd),
+                    "--upload-port",
+                    e.upload,
+                ],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+            ) as process:
+                try:
+                    output = bytearray()
+
+                    def until(expected: bytes) -> None:
+                        deadline = time.monotonic() + 10
+                        while expected not in output:
+                            remaining = deadline - time.monotonic()
+                            self.assertGreater(remaining, 0, bytes(output))
+                            self.assertIsNone(process.poll(), bytes(output))
+                            if select.select([master], [], [], remaining)[0]:
+                                output.extend(os.read(master, 4096))
+
+                    until(b"Connected;")
+                    if command is not None:
+                        # Wait for raw mode before sending the command to avoid
+                        # the terminal's canonical input buffering.
+                        deadline = time.monotonic() + 2
+                        while termios.tcgetattr(slave)[3] & termios.ICANON:
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.01)
+                        os.write(master, command)
+                    until(marker)
+                    if command is None:
+                        until(b"pico> ")
+                        os.write(master, b"run\r")
+                        until(b"syscalls and reset state OK")
+                    os.write(master, b"\x1d")
+                    self.assertEqual(process.wait(timeout=3), 0, bytes(output))
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=3)
+            self.assertEqual(termios.tcgetattr(slave), attributes)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_send_only_host_command(self) -> None:
+        e = self.emulator
+        e.console.write(b"load\r")
+        e.until(b"waiting for ELF")
+        result = subprocess.run(
+            [
+                str(ROOT / "src/pico.py"),
+                "--send",
+                str(ROOT / "build/hello.elf"),
+                "--upload-port",
+                e.upload,
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"loaded; ready to run", result.stdout)
+        e.until(b"pico> ")
+        self.assertIn(b"syscalls and reset state OK", e.command("run"))
 
     def test_exec_contract(self) -> None:
         check_exec(self.emulator)

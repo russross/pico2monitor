@@ -3,7 +3,7 @@
 import time
 from typing import Protocol
 
-from pico_send import SerialPort
+from pico import SerialPort
 
 
 class Session(Protocol):
@@ -27,8 +27,9 @@ def check_exec(session: Session) -> None:
     assert b"arg: two words\r\narg: \r\n" in output, output
     assert b"env:" not in output, output
     assert b"exec heap OK" in output and b"exit:" not in output, output
-    session.command("reset")
-    assert b"exec data=7 bss=0" in session.command("run")
+    output = session.command('run again "two words" ""')
+    assert b"exec data=7 bss=0 argc=4" in output, output
+    assert b"arg: again\r\narg: two words\r\narg: \r\n" in output, output
 
     session.load("exec.elf", reset=False)
     assert b"reset unavailable" in session.command("reset")
@@ -43,9 +44,7 @@ def check_exec(session: Session) -> None:
 
 def check_threads(session: Session) -> None:
     session.load("threads.elf")
-    for attempt in range(2):
-        if attempt:
-            session.command("reset")
+    for _ in range(2):
         output = session.command("run")
         assert b"thread replacement OK" in output and b"exit:" not in output, output
         info = session.command("info")
@@ -62,6 +61,8 @@ def check_threads(session: Session) -> None:
         info = session.command("info")
         assert b"state: stopped" in info, info
         assert b"thread 0: runnable" in info and b"thread 1: runnable" in info, info
+        assert b"run requires a ready" in session.command("run")
+        assert b"state: stopped" in session.command("info")
         session.console.write(b"resume\r")
     time.sleep(0.02)
     session.console.write(b"\x1b")

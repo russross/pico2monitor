@@ -9,10 +9,10 @@ GUESTS := $(addprefix build/,$(addsuffix .elf,hello echo loop exit23 registers e
 PROBES := $(addprefix build/probe,$(addsuffix .elf,1 2 3 4 5 6 7 8 9 10 11 12))
 NATIVE_SOURCES := memory launch map elf wire loader program transfer
 C_FILES := $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
-PY_FILES := $(wildcard src/*.py scripts/*.py tests/*.py) src/pico-send src/pico-console
+PY_FILES := $(wildcard src/*.py scripts/*.py tests/*.py)
 
 .PHONY: all deps firmware guests emulator check native-check emulator-check panic-check format format-check flash install-udev clean
-all: dist/monitor.uf2 dist/pico-send dist/pico-console guests build/emulator
+all: dist/monitor.uf2 dist/pico guests build/emulator
 deps:
 	./scripts/setup-deps.py
 
@@ -28,10 +28,8 @@ build/monitor.uf2 build/monitor_emu.hex &: firmware
 	@test -f $@
 dist/monitor.uf2: build/monitor.uf2 | dist
 	cp $< $@
-dist/pico_send.py dist/pico_console.py dist/pico-send dist/pico-console: dist/%: src/% | dist
+dist/pico: src/pico.py | dist
 	cp $< $@
-dist/pico-send: dist/pico_send.py
-dist/pico-console: dist/pico_console.py dist/pico_send.py
 
 guests: $(GUESTS) $(PROBES)
 build/hello.elf build/echo.elf build/loop.elf build/exit23.elf: tests/guest_demo.c $(GUEST_COMMON) | build deps

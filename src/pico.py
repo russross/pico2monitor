@@ -1,4 +1,5 @@
-"""Raw ELF upload over the monitor's dedicated CDC serial interface."""
+#!/usr/bin/env python3
+"""Connect to the Pico monitor and upload a RISC-V ELF executable."""
 
 from __future__ import annotations
 
@@ -8,10 +9,12 @@ import errno
 import fcntl
 import os
 import select
+import signal
 import struct
 import sys
 import termios
 import time
+import tty
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -19,6 +22,7 @@ from pathlib import Path
 PAYLOAD_LIMIT = 1024
 FRAME_LIMIT = 1100
 HEADER = struct.Struct("<BBQIIH")
+DETACH = b"\x1b]pico-console;detach\x07"
 
 
 class Kind(IntEnum):
@@ -96,9 +100,10 @@ class Frame:
 
 
 class SerialPort:
-    def __init__(self, path: str):
+    def __init__(self, path: str, console: SerialPort | None = None):
         self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         self.buffer = bytearray()
+        self.console = console
         try:
             attributes = termios.tcgetattr(self.fd)
             attributes[0] = attributes[1] = attributes[3] = 0
@@ -153,8 +158,20 @@ class SerialPort:
             if len(self.buffer) > FRAME_LIMIT:
                 self.buffer.clear()
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([self.fd], [], [], remaining)[0]:
+            if remaining <= 0:
                 raise TimeoutError("serial response timed out")
+            # Upload replies and console output share USB bandwidth. Drain both
+            # interfaces so diagnostics cannot block completion of the upload.
+            readers = [self.fd]
+            if self.console is not None:
+                readers.append(self.console.fd)
+            ready = select.select(readers, [], [], remaining)[0]
+            if not ready:
+                raise TimeoutError("serial response timed out")
+            if self.console is not None and self.console.fd in ready:
+                write_output(read_console(self.console))
+            if self.fd not in ready:
+                continue
             try:
                 block = os.read(self.fd, 4096)
             except BlockingIOError:
@@ -200,7 +217,7 @@ def exchange(port: SerialPort, frame: Frame, expected_sequence: int, expected_of
     raise UploadError(f"no acknowledgement for file offset {frame.offset}")
 
 
-def send_file(path: Path, port_name: str, *, preflight: bool = True) -> str:
+def read_image(path: Path, *, preflight: bool = True) -> bytes:
     data = path.read_bytes()
     if not 52 <= len(data) <= 1024 * 1024:
         raise UploadError("ELF must be between 52 bytes and 1 MiB")
@@ -208,8 +225,15 @@ def send_file(path: Path, port_name: str, *, preflight: bool = True) -> str:
         data[:7] != b"\x7fELF\x01\x01\x01" or struct.unpack_from("<HH", data, 16) != (2, 243)
     ):
         raise UploadError("expected a little-endian RISC-V ELF32 ET_EXEC")
+    return data
+
+
+def send_file(
+    path: Path, port_name: str, *, preflight: bool = True, console: SerialPort | None = None
+) -> str:
+    data = read_image(path, preflight=preflight)
     name = path.name.encode("ascii", errors="replace")[:63]
-    port = SerialPort(port_name)
+    port = SerialPort(port_name, console)
     session: int | None = None
     try:
         try:
@@ -249,28 +273,128 @@ def send_file(path: Path, port_name: str, *, preflight: bool = True) -> str:
         port.close()
 
 
-def discover_upload_port() -> str:
-    candidates = sorted(Path("/dev/serial/by-id").glob("*RV32_SRAM_monitor*if02*"))
+def discover_port(interface: str, option: str) -> str:
+    candidates = sorted(Path("/dev/serial/by-id").glob(f"*RV32_SRAM_monitor*{interface}*"))
     if len(candidates) != 1:
-        raise UploadError("specify --port with the monitor's upload CDC device")
+        raise UploadError(f"specify {option} with the monitor's {interface} CDC device")
     return str(candidates[0])
+
+
+def split_output(data: bytes) -> tuple[bytes, bytes, bool]:
+    """Keep a possible partial detach sequence until the next serial read."""
+    position = data.find(DETACH)
+    if position >= 0:
+        return data[:position], b"", True
+    for size in range(min(len(data), len(DETACH) - 1), 0, -1):
+        if data.endswith(DETACH[:size]):
+            return data[:-size], data[-size:], False
+    return data, b"", False
+
+
+def read_console(port: SerialPort) -> bytes:
+    data = os.read(port.fd, 4096)
+    if not data:
+        raise UploadError("console disconnected")
+    return data
+
+
+def write_output(data: bytes) -> None:
+    while data:
+        data = data[os.write(sys.stdout.fileno(), data) :]
+
+
+def wait_console(port: SerialPort, marker: bytes) -> None:
+    deadline = time.monotonic() + 8
+    pending = b""
+    while marker not in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([port.fd], [], [], remaining)[0]:
+            raise UploadError(f"console timeout waiting for {marker!r}")
+        data = read_console(port)
+        write_output(data)
+        pending = (pending + data)[-4096:]
+
+
+# Combined mode interrupts any current input or guest before arming the upload.
+# The console descriptor remains open through upload and interactive operation.
+def console_session(port_name: str, image: Path | None, upload_name: str | None) -> None:
+    attributes = termios.tcgetattr(sys.stdin.fileno())
+    port = SerialPort(port_name)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        if image is not None:
+            if upload_name is None:
+                raise UploadError("upload port unavailable")
+            port.write(b"\x03")
+            wait_console(port, b"pico> ")
+            port.write(b"load\r")
+            wait_console(port, b"waiting for ELF")
+            message = send_file(image, upload_name, console=port)
+            write_output(f"\r\n{image}: {message}; ready to run\r\n".encode())
+        pending = b""
+        while True:
+            ready = select.select([sys.stdin.fileno(), port.fd], [], [])[0]
+            if port.fd in ready:
+                data, pending, detach = split_output(pending + read_console(port))
+                write_output(data)
+                if detach:
+                    return
+            if sys.stdin.fileno() in ready:
+                data = os.read(sys.stdin.fileno(), 256)
+                if not data or b"\x1d" in data:
+                    return
+                port.write(data)
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attributes)
+        port.close()
+
+
+def interrupted(number: int, frame: object) -> None:
+    del number, frame
+    raise KeyboardInterrupt
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", type=Path)
-    parser.add_argument("--port", help="upload CDC device (second serial interface)")
+    parser.add_argument(
+        "--send", action="store_true", help="upload only; type load in the console first"
+    )
+    parser.add_argument(
+        "image", type=Path, nargs="?", help="ELF file to upload; omit for console only"
+    )
+    parser.add_argument("--console-port", help="console CDC device (first serial interface)")
+    parser.add_argument("--upload-port", help="upload CDC device (second serial interface)")
     arguments = parser.parse_args()
+    if arguments.send and arguments.image is None:
+        parser.error("--send requires an image")
+    if not arguments.send and not sys.stdin.isatty():
+        parser.error("console mode requires an interactive terminal")
+    signal.signal(signal.SIGTERM, interrupted)
     try:
-        port_name = arguments.port or discover_upload_port()
-        message = send_file(arguments.image, port_name)
-        print(f"{arguments.image}: {message}; ready to run")
+        # Validate the local file before opening or interrupting the board.
+        if arguments.image is not None:
+            read_image(arguments.image)
+        upload_name = None
+        if arguments.image is not None:
+            upload_name = arguments.upload_port or discover_port("if02", "--upload-port")
+        if arguments.send:
+            if upload_name is None:
+                raise UploadError("upload port unavailable")
+            message = send_file(arguments.image, upload_name)
+            print(f"{arguments.image}: {message}; ready to run")
+        else:
+            console_name = arguments.console_port or discover_port("if00", "--console-port")
+            print(
+                "Connected; Ctrl-D or Ctrl-] detaches. Ctrl-C/Escape suspends the guest.",
+                flush=True,
+            )
+            console_session(console_name, arguments.image, upload_name)
         return 0
     except (OSError, UploadError, TimeoutError) as error:
-        print(f"pico-send: {error}", file=sys.stderr)
+        print(f"pico: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("pico-send: cancelled", file=sys.stderr)
+        print("pico: cancelled", file=sys.stderr)
         return 130
 
 

@@ -5,8 +5,7 @@ import pty
 import threading
 import unittest
 
-from pico_console import DETACH, split_output
-from pico_send import Frame, Kind, SerialPort, UploadError
+from pico import DETACH, Frame, Kind, SerialPort, UploadError, split_output
 
 
 class HostTests(unittest.TestCase):

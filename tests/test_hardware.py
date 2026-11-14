@@ -12,7 +12,7 @@ from pathlib import Path
 
 from test_exec import check_exec, check_threads
 
-from pico_send import SerialPort, UploadError, send_file
+from pico import SerialPort, UploadError, send_file
 
 
 class Hardware:

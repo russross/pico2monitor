@@ -7,6 +7,9 @@ static char line[2305];
 static size_t length;
 static bool prompt_pending, swallow_lf;
 static bool line_overflow;
+static char *args[34];
+static unsigned pending_argc;
+static bool run_pending;
 
 static void detach(void) {
     static const char sequence[] = "\033]pico-console;detach\007";
@@ -23,6 +26,7 @@ void shell_notice(const char *message) {
     shell_prompt();
 }
 void shell_disconnected(void) {
+    run_pending = false;
     program_suspend("console disconnected");
     transfer_cancel("USB console disconnected");
     length = 0;
@@ -76,7 +80,7 @@ static void info(void) {
 
 /* Tokenization supports literal quoting and backslash escaping without shell
  * expansion. Parsing completes before any command mutates program state. */
-static int tokenize(char **args) {
+static int tokenize(char **tokens) {
     char *read = line, *write = line;
     int count = 0;
     while (*read) {
@@ -86,7 +90,7 @@ static int tokenize(char **args) {
             break;
         if (count == 34)
             return -1;
-        args[count++] = write;
+        tokens[count++] = write;
         char quote = 0;
         while (*read && (quote || (*read != ' ' && *read != '\t'))) {
             char c = *read++;
@@ -122,8 +126,8 @@ static const CommandHelp commands[] = {
      "Show the loaded image, execution state, and I/O counters."},
     {"map", "map", "Show the memory map", "Show the guest memory map and permissions."},
     {"run", "run [ARG ...]", "Start the loaded program",
-     "Start a ready program with optional arguments. Reset an exited program before running "
-     "again."},
+     "Start with optional arguments; automatically reset exited programs when supported. "
+     "Suspended or faulted programs require explicit reset."},
     {"resume", "resume", "Resume a suspended program",
      "Continue from the saved program state and pending system call."},
     {"reset", "reset", "Reset the loaded program",
@@ -151,7 +155,6 @@ static void help(const char *name) {
 }
 
 static void execute(void) {
-    char *args[34];
     int argc = tokenize(args);
     if (argc <= 0) {
         if (argc < 0)
@@ -192,6 +195,16 @@ static void execute(void) {
             return;
         }
     } else if (strcmp(line, "run") == 0) {
+        /* The parsed command stays in monitor storage while reset advances.
+         * Suspended contexts remain intact until an explicit reset command. */
+        if (program.state == EXITED && program.image.plan.snapshot) {
+            program_reset();
+            if (program.reset_busy) {
+                pending_argc = (unsigned)argc - 1;
+                run_pending = true;
+                return;
+            }
+        }
         error = program_launch((unsigned)argc - 1, (const char *const *)(args + 1));
         if (!error)
             return;
@@ -262,6 +275,17 @@ void shell_input(uint8_t byte) {
 }
 
 void shell_step(void) {
+    /* Reset completion requests a prompt; a queued run consumes that request
+     * before starting the guest with the retained command arguments. */
+    if (run_pending && !program.reset_busy) {
+        run_pending = false;
+        const char *error = program_launch(pending_argc, (const char *const *)(args + 1));
+        if (error) {
+            console_printf("%s\r\n", error);
+            shell_prompt();
+        } else
+            prompt_pending = false;
+    }
     memory_map_step();
     if (prompt_pending && console_connected() && console_empty() && !program.reset_busy &&
         !memory_map_busy() && program.state != RUNNING && program.state != WAITING &&

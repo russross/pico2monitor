@@ -11,11 +11,10 @@ Build and use
 
 1. On Linux x86-64, install GNU Make, a C compiler, Python 3.13 or later, `patch`, `uv`, and Debian/Ubuntu `apt-get`, `dpkg-deb`, and the `libclang-cpp19` and `libllvm19` runtime packages for formatting checks. Run `make`; `make deps` downloads and verifies the pinned SDK, compiler, CMake, picotool, and emulator header into `deps/`. The first run needs network access.
 2. Flash explicitly with `make flash` (which uses sudo for picotool).
-3. Connect with `./dist/pico-console` and type `load`.
-4. In another terminal, run `./dist/pico-send build/assembly.elf`. The monitor prints the loaded image's memory map.
-5. Type `run`. Ctrl-C/Escape suspends; `resume` continues; `reset` prepares another run. Ctrl-D at the monitor, Ctrl-], or `quit` detaches the host console; Ctrl-D in a guest sends terminal EOF.
+3. Run `./dist/pico build/assembly.elf` to connect, upload, and keep the console open. The monitor prints the loaded image's memory map.
+4. Type `run`. Ctrl-C/Escape suspends; `resume` continues; `reset` prepares another run. Ctrl-D at the monitor, Ctrl-], or `quit` detaches the host console; Ctrl-D in a guest sends terminal EOF.
 
-Both channels use the same USB cable. Utilities prefer stable serial identities; `--port DEVICE` selects a particular board. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
+Both channels use the same USB cable. `pico` connects without uploading. `pico --send FILE` uploads without opening a console; first type `load` in an existing console. The script uses only Python's standard library and Unix serial interfaces; it needs no SDK or third-party Python packages. Stable serial identities are selected automatically; `--console-port DEVICE` and `--upload-port DEVICE` override them. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
 
 `build/exec.elf` demonstrates quoted arguments, empty envp, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20000000`. `build/threads.elf` demonstrates explicit stack setup and reusable thread slots. Older hello/echo/loop/register examples and protection probes retain the higher-address fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
 

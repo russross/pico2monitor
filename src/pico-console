@@ -1,4 +1,0 @@
-#!/usr/bin/env python3
-from pico_console import main
-
-raise SystemExit(main())
