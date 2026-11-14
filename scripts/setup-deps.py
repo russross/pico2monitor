@@ -15,6 +15,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Asset identity and both hashes keep the generated emulator and local fix paired.
+EMULATOR_URL = "https://api.github.com/repos/c1570/rp2350js/releases/assets/724171802"
+EMULATOR_SHA256 = "44731efa8dfcb06a3c0395ed0b2058b82d8eb10fbbaf6b4b74121d7be9c7a170"
+PATCHED_EMULATOR_SHA256 = "acac377069a63640131e2a49345c57037ccf5288f7999aaa130ee159ccd5fd00"
+
 
 @dataclass(frozen=True)
 class Archive:
@@ -98,23 +103,21 @@ def main() -> int:
         header = ROOT / "deps/rp2350js-c.h"
         if not header.exists():
             header.parent.mkdir(parents=True, exist_ok=True)
-            data = urllib.request.urlopen(
-                "https://github.com/c1570/rp2350js/releases/download/rolling/rp2350js-c.h"
-            ).read()
-            if (
-                hashlib.sha256(data).hexdigest()
-                != "45682659e17cb0b241dbdaac0e9c9731f9d1c89da0c89387395cb318e2ba9971"
-            ):
-                raise RuntimeError(
-                    "rp2350js rolling release changed; audit and update its pinned checksum"
-                )
+            request = urllib.request.Request(
+                EMULATOR_URL, headers={"Accept": "application/octet-stream"}
+            )
+            with urllib.request.urlopen(request) as response:
+                data = response.read()
+            if hashlib.sha256(data).hexdigest() != EMULATOR_SHA256:
+                raise RuntimeError("emulator asset checksum mismatch")
             header.write_bytes(data)
         checksum = hashlib.sha256(header.read_bytes()).hexdigest()
-        if checksum == "45682659e17cb0b241dbdaac0e9c9731f9d1c89da0c89387395cb318e2ba9971":
+        if checksum == EMULATOR_SHA256:
             subprocess.run(
                 ["patch", "-p1", "-i", str(ROOT / "scripts/rp2350js-c.patch")], cwd=ROOT, check=True
             )
-        elif checksum != "03c72886dbebdfb630f2cbe25ae5a42efbb9cd72f7c35c3ba22e4165e81de8c7":
+        # Verify patch output too, including the first installation.
+        if hashlib.sha256(header.read_bytes()).hexdigest() != PATCHED_EMULATOR_SHA256:
             raise RuntimeError("emulator header differs from the pinned release and ORC.B patch")
         return 0
     except (OSError, RuntimeError, tarfile.TarError, subprocess.CalledProcessError) as error:

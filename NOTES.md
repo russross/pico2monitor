@@ -130,6 +130,8 @@ After reset, clear both thread records and status/accounting, reset slot 0's PC 
 Build and validation
 --------------------
 
+Dependency setup downloads the generated emulator header through GitHub release asset ID 724171802 (upstream commit eefa1d62e82902c8f9986ab9293cf273bda30583), with SHA-256 checks before and after the ORC.B patch. It does not follow the mutable rolling download URL. Cached headers from another version are rejected; remove `deps/rp2350js-c.h` to fetch the pinned asset. A deleted upstream asset fails explicitly rather than accepting a newer emulator.
+
 `VERSION` names the release version. `make release` packages `dist/monitor.uf2`, executable `dist/pico`, and `dist/README.md` (copied from `RELEASE.md`) into `dist/pico2monitor-VERSION.tar.gz`, with those three files at its root. The release quickstart is separate from the development README.
 
 On every push, `.github/workflows/release.yml` checks for remote tag `vVERSION`; an existing tag ends release work. Missing tags trigger a build, full `make check`, and `make release`. Publication is serialized across branches. A draft targets the triggering commit; the archive and three individual files upload before publication creates the tag. Failed uploads leave an untagged draft. A rerun for the same commit replaces draft assets and retries publication; a draft for another commit fails explicitly for manual resolution. The workflow needs contents write permission. Local Git operations remain read-only.
