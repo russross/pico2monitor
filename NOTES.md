@@ -130,6 +130,8 @@ After reset, clear both thread records and status/accounting, reset slot 0's PC 
 Build and validation
 --------------------
 
+Stripped dependency archives must contain exactly one top-level directory; loose metadata files are ignored when selecting it. Setup verifies the expected marker inside that directory before installation. The picotool archive also contains a top-level `.keep` file, so extraction entry order must not determine its installation root.
+
 Dependency setup downloads the generated emulator header through GitHub release asset ID 724171802 (upstream commit eefa1d62e82902c8f9986ab9293cf273bda30583), with SHA-256 checks before and after the ORC.B patch. It does not follow the mutable rolling download URL. Cached headers from another version are rejected; remove `deps/rp2350js-c.h` to fetch the pinned asset. A deleted upstream asset fails explicitly rather than accepting a newer emulator.
 
 `VERSION` names the release version. `make release` packages `dist/monitor.uf2`, executable `dist/pico`, and `dist/README.md` (copied from `RELEASE.md`) into `dist/pico2monitor-VERSION.tar.gz`, with those three files at its root. The release quickstart is separate from the development README.

@@ -85,9 +85,17 @@ def install(archive: Archive) -> None:
         unpacked = folder / "unpacked"
         with tarfile.open(download) as tar:
             tar.extractall(unpacked, filter="data")
-        source = next(unpacked.iterdir()) if archive.strip else unpacked
+        # Release archives may include loose metadata beside their root directory.
+        source = unpacked
+        if archive.strip:
+            directories = [entry for entry in unpacked.iterdir() if entry.is_dir()]
+            if len(directories) != 1:
+                raise RuntimeError(f"{archive.destination}: expected one archive root directory")
+            source = directories[0]
+        if not (source / archive.marker).is_file():
+            raise RuntimeError(f"{archive.destination}: archive missing {archive.marker}")
         if destination.exists():
-            if any(destination.iterdir()):
+            if not destination.is_dir() or any(destination.iterdir()):
                 raise RuntimeError(
                     f"{destination}: incomplete dependency exists; inspect it before replacing"
                 )
