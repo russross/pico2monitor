@@ -14,7 +14,11 @@ Build and use
 3. Run `./dist/pico build/assembly.elf` to connect, upload, and keep the console open. The monitor prints a one-line load summary; type `map` to inspect memory and protections.
 4. Type `run`. Ctrl-C/Escape suspends; `resume` continues; `reset` prepares another run. Ctrl-D at the monitor, Ctrl-], or `quit` detaches the host console; Ctrl-D in a guest sends terminal EOF.
 
-Both channels use the same USB cable. `pico` connects without uploading. `pico --send FILE` uploads without opening a console; first type `load` in an existing console. The script uses only Python's standard library and Unix serial interfaces; it needs no SDK or third-party Python packages. Stable serial identities are selected automatically; `--console-port DEVICE` and `--upload-port DEVICE` override them. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
+Both channels use the same USB cable. `pico` connects without uploading. To separate guest I/O, type `load` in that monitor and run `pico --send FILE` in another terminal; the sender remains attached as the guest terminal. `pico --send FILE --detach` uploads and exits. `pico --attach` attaches guest I/O without uploading. Uploading and attaching never run the guest automatically. Load options pass through in combined mode: `pico FILE --no-reset` issues `load --no-reset`.
+
+In split mode the monitor remains a shell while the guest runs. `suspend` stops both threads; `io` shows routing and `io merge` merges it while stopped. Ctrl-] in the guest terminal suspends and merges automatically. A lost guest connection or expired five-second heartbeat lease also suspends and merges, reporting one status line to the monitor. Guest EOF remains Ctrl-D. Each serial interface has one cooperating `pico` owner; merge before using another process to upload on the guest interface.
+
+The script uses only Python's standard library and Unix serial interfaces; it needs no SDK or third-party Python packages. Stable serial identities are selected automatically; `--console-port DEVICE` and `--upload-port DEVICE` override them. Console is -if00 and upload/guest is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
 
 `build/exec.elf` demonstrates quoted arguments, empty envp, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20000000`. `build/threads.elf` demonstrates explicit stack setup and reusable thread slots. Older hello/echo/loop/register examples and protection probes retain the higher-address fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
 
@@ -22,11 +26,11 @@ Both channels use the same USB cable. `pico` connects without uploading. `pico -
 Memory and shell
 ----------------
 
-Guest images can link at the stable SRAM base, 0x20000000. The monitor executes from flash and reserves the top 16 KiB of main SRAM for static storage. The 496 KiB below that boundary holds guest segments, heap, initial stack, and protected reset data. Scratch SRAM holds a 4 KiB console output ring and one shared 4 KiB monitor stack. Monitor faults stop the peer before reusing guest RAM as a recovery stack. Linker assertions, measured stack high-water output, and compiler stack-usage reports support the budget.
+Guest images can link at the stable SRAM base, 0x20000000. The monitor executes from flash and reserves the top 16 KiB of main SRAM for static storage. The 496 KiB below that boundary holds guest segments, heap, initial stack, and protected reset data. Scratch SRAM holds separate 2 KiB monitor and guest output rings and one shared 4 KiB monitor stack. Monitor operations wait for output to drain before executing the next command; USB and guest service continue during these fences. Monitor faults stop the peer before reusing guest RAM as a recovery stack. Linker assertions, measured stack high-water output, and compiler stack-usage reports support the budget.
 
 Either core can enter the monitor through a stack-free atomic gate. Monitor calls advance bounded state-machine work and release the lock before resuming a guest or waiting for an interrupt. Custom syscall 1000 starts a second thread at a supplied PC with a parameter in a0 and all other registers zero. Guests own additional stack and TLS arrangements; no special load mode is needed. Ctrl-C/Escape suspends both threads before presenting the prompt.
 
-The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `info`, `map`, `help [COMMAND]`, `quit`, and `bootsel`.
+The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `suspend`, `io [merge]`, `info`, `map`, `help [COMMAND]`, `quit`, and `bootsel`.
 
 Loading retains initialized writable data for reset when the verified layout leaves at least 32 KiB of heap capacity. Otherwise reset support is automatically disabled. `load --no-reset` omits reset storage for that upload. Reset requires retained support; its memory/PMP layout stays fixed until reload. Arguments remain supported; the environment is always empty.
 

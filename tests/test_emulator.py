@@ -20,7 +20,7 @@ from typing import TextIO
 
 from test_exec import check_exec, check_threads
 
-from pico import Frame, Kind, SerialPort, UploadError, exchange, send_file
+from pico import Frame, Kind, SerialPort, UploadError, claim_guest, exchange, send_file
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -115,6 +115,102 @@ class MonitorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.emulator = self.enterContext(running_emulator())
 
+    def guest_until(self, port: SerialPort, marker: bytes) -> bytes:
+        output = bytearray()
+        deadline = time.monotonic() + 5
+        while marker not in output:
+            self.assertLess(time.monotonic(), deadline, bytes(output))
+            port.write(Frame(Kind.PING, 123).encode())
+            reply = port.receive(1)
+            if reply.kind == Kind.OUTPUT:
+                output.extend(reply.payload)
+        return bytes(output)
+
+    def test_split_guest_and_monitor(self) -> None:
+        e = self.emulator
+        e.load("echo.elf")
+        port = SerialPort(e.upload)
+        try:
+            claim_guest(port, 123)
+            self.assertIn(b"io: split; guest terminal attached", e.until(b"pico> "))
+            # A repeated claim replays its acknowledgment without a second notice.
+            claim_guest(port, 123)
+            port.write(Frame(Kind.CLAIM, 456).encode())
+            self.assertEqual(port.receive(1).kind, Kind.ERROR)
+            self.assertIn(b"io: split", e.command("io"))
+            self.assertNotIn(b"guest terminal attached", e.command("run"))
+            self.guest_until(port, b"returns to the monitor\r\n")
+            self.assertIn(b"state: waiting", e.command("info"))
+            self.assertIn(b"suspend the guest", e.command("reset"))
+            self.assertIn(b"suspend the guest", e.command("io merge"))
+            port.write(Frame(Kind.INPUT, 123, payload=b"separate\r").encode())
+            self.guest_until(port, b"separate\r\nseparate\r\n")
+            self.assertIn(b"suspended: monitor request", e.command("suspend"))
+            self.assertIn(b"io: split", e.command("io"))
+            # An asynchronous notice preserves a partially typed monitor command.
+            e.console.write(b"in")
+            e.until(b"in")
+            port.write(Frame(Kind.RELEASE, 123).encode())
+            notice = e.until(b"pico> ")
+            self.assertEqual(notice.count(b"io: combined;"), 1)
+            e.until(b"in")
+            e.console.write(b"fo\r")
+            self.assertIn(b"state: stopped", e.until(b"pico> "))
+            self.assertEqual(port.receive(1).kind, Kind.RELEASED)
+        finally:
+            port.close()
+
+    def test_guest_lease_loss_suspends_and_merges(self) -> None:
+        e = self.emulator
+        e.load("threads_busy.elf")
+        port = SerialPort(e.upload)
+        try:
+            claim_guest(port, 123)
+            e.until(b"pico> ")
+            e.command("run")
+            # The emulator retains DTR even after a PTY closes. Lease expiry covers
+            # both a vanished client and one that leaves the serial port open.
+            notice = e.until(b"guest heartbeat expired", timeout=15)
+            self.assertIn(b"io: combined; guest suspended;", notice)
+            e.until(b"pico> ")
+            self.assertIn(b"state: stopped", e.command("info"))
+            e.console.write(b"resume\r")
+            time.sleep(0.05)
+            e.console.write(b"\x03")
+            e.until(b"pico> ")
+        finally:
+            port.close()
+
+    def test_retained_guest_owner_uploads_on_same_connection(self) -> None:
+        e = self.emulator
+        e.load("hello.elf")
+        port = SerialPort(e.upload)
+        try:
+            claim_guest(port, 123)
+            e.until(b"pico> ")
+            e.console.write(b"load --no-reset\r")
+            e.until(b"waiting for ELF")
+            send_file(ROOT / "build/echo.elf", e.upload, port=port)
+            self.assertIn(b"reset=unavailable", e.until(b"pico> "))
+            claim_guest(port, 123)
+            self.assertNotIn(b"guest terminal attached", e.command("run"))
+            self.guest_until(port, b"returns to the monitor\r\n")
+            port.write(Frame(Kind.INPUT, 123, payload=b"\x03").encode())
+            self.assertIn(b"suspended: Ctrl-C", e.until(b"pico> "))
+            self.assertIn(b"guest terminal merged", e.command("io merge"))
+        finally:
+            port.close()
+
+    def test_monitor_output_fences(self) -> None:
+        e = self.emulator
+        # A long echoed command and a queued next command must each receive their
+        # full output even when the host delays reading the monitor endpoint.
+        e.console.write(b"help " + b" " * 2200 + b"info\rhelp\rinfo\r")
+        time.sleep(0.1)
+        self.assertIn(b"Usage: info", e.until(b"pico> "))
+        self.assertIn(b"Commands:", e.until(b"pico> "))
+        self.assertIn(b"output-dropped=0", e.until(b"pico> "))
+
     def test_combined_host_command(self) -> None:
         e = self.emulator
         e.load("loop.elf")
@@ -125,6 +221,64 @@ class MonitorTests(unittest.TestCase):
     def test_console_only_host_command(self) -> None:
         self.check_host_console([], b"state: empty", command=b"info\r")
 
+    def test_combined_load_options(self) -> None:
+        self.check_host_console([str(ROOT / "build/hello.elf"), "--no-reset"], b"reset=unavailable")
+
+    def test_guest_host_commands(self) -> None:
+        e = self.emulator
+        for send in (True, False):
+            with self.subTest(send=send):
+                if send:
+                    e.console.write(b"load\r")
+                    e.until(b"waiting for ELF")
+                    arguments = ["--send", str(ROOT / "build/echo.elf")]
+                else:
+                    e.load("echo.elf")
+                    arguments = ["--attach"]
+                master, slave = pty.openpty()
+                attributes = termios.tcgetattr(slave)
+                try:
+                    with subprocess.Popen(
+                        [str(ROOT / "src/pico.py"), *arguments, "--upload-port", e.upload],
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=slave,
+                    ) as process:
+                        try:
+                            output = bytearray()
+
+                            def until(
+                                marker: bytes, terminal: int = master, received: bytearray = output
+                            ) -> None:
+                                deadline = time.monotonic() + 10
+                                while marker not in received:
+                                    remaining = deadline - time.monotonic()
+                                    self.assertGreater(remaining, 0, bytes(received))
+                                    self.assertIsNone(process.poll(), bytes(received))
+                                    if select.select([terminal], [], [], remaining)[0]:
+                                        received.extend(os.read(terminal, 4096))
+
+                            until(b"Guest attached;")
+                            e.until(b"io: split;")
+                            e.until(b"pico> ")
+                            e.command("run")
+                            until(b"returns to the monitor\r\n")
+                            os.write(master, b"host guest\r")
+                            until(b"host guest\r\nhost guest\r\n")
+                            self.assertIn(b"state: waiting", e.command("info"))
+                            os.write(master, b"\x1d")
+                            self.assertEqual(process.wait(timeout=4), 0, bytes(output))
+                            self.assertIn(b"guest terminal detached", e.until(b"pico> "))
+                            self.assertIn(b"state: stopped", e.command("info"))
+                        finally:
+                            if process.poll() is None:
+                                process.terminate()
+                                process.wait(timeout=3)
+                    self.assertEqual(termios.tcgetattr(slave), attributes)
+                finally:
+                    os.close(master)
+                    os.close(slave)
+
     def check_host_console(
         self, arguments: list[str], marker: bytes, *, command: bytes | None = None
     ) -> None:
@@ -133,13 +287,15 @@ class MonitorTests(unittest.TestCase):
         e = self.emulator
         master, slave = pty.openpty()
         attributes = termios.tcgetattr(slave)
+        console_name = os.ttyname(e.console.fd)
+        e.console.close()
         try:
             with subprocess.Popen(
                 [
                     str(ROOT / "src/pico.py"),
                     *arguments,
                     "--console-port",
-                    os.ttyname(e.console.fd),
+                    console_name,
                     "--upload-port",
                     e.upload,
                 ],
@@ -182,6 +338,7 @@ class MonitorTests(unittest.TestCase):
                         process.wait(timeout=3)
             self.assertEqual(termios.tcgetattr(slave), attributes)
         finally:
+            e.console = SerialPort(console_name)
             os.close(master)
             os.close(slave)
 
@@ -193,6 +350,7 @@ class MonitorTests(unittest.TestCase):
             [
                 str(ROOT / "src/pico.py"),
                 "--send",
+                "--detach",
                 str(ROOT / "build/hello.elf"),
                 "--upload-port",
                 e.upload,

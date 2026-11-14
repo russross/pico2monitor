@@ -36,13 +36,15 @@ Upload and iterate
 ------------------
 
 1. Run `./dist/pico hello.elf` in an interactive terminal. It connects, suspends any running guest, issues `load`, uploads the file, and leaves the console open.
-2. Inspect the automatic memory map and type `run`, optionally followed by arguments.
+2. Inspect the load summary, use `map` if needed, and type `run`, optionally followed by arguments.
 3. Use Ctrl-C/Escape to suspend, `resume` to continue, or `reset` then `run` to restart a suspended guest. After exit, `run` automatically resets when supported.
 4. Use Ctrl-D or `quit` at the monitor prompt, or Ctrl-] in the host terminal, to detach. Ctrl-C and Escape are sent to the board.
 
-`./dist/pico` connects without uploading. To upload separately, type `load` (or `load --no-reset`) in an existing console, then run `./dist/pico --send hello.elf` in another terminal. The single script uses only Python's standard library and Unix serial interfaces; no Pico SDK is needed on the host.
+`./dist/pico` connects without uploading. To upload separately, type `load` (or `load --no-reset`) in an existing console, then run `./dist/pico --send hello.elf` in another terminal. That terminal stays attached for guest input/output; use `--send hello.elf --detach` to upload and exit. `./dist/pico --attach` separates guest I/O without uploading. Attach while the guest is suspended or otherwise not running. Neither upload nor attachment starts execution. Combined mode forwards load options: `./dist/pico hello.elf --no-reset` issues `load --no-reset`.
 
-Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The console and upload use separate USB CDC interfaces. The script selects stable device identities automatically; use `--console-port DEVICE` and `--upload-port DEVICE` when needed. When multiple boards are connected, specify both devices for the same board. Console uses the interface ending in -if00; upload uses -if02. Ordinary terminal software also works with local echo disabled.
+In split mode the monitor accepts commands while the guest runs. `suspend` stops both threads; read-only `info`, `map`, and `help` remain available while running. `io` reports routing and `io merge` returns guest I/O to the monitor while stopped. The guest terminal stays attached through suspension, exit, fault, and reset. Ctrl-] there suspends and merges, as does connection loss or an expired five-second heartbeat lease. Losing the monitor also suspends and merges. Status changes appear as single lines on the monitor, preserving a partially typed command. Merge before another host process uploads through the second interface.
+
+Guest console output translates LF to CRLF. Input is echoed and buffered until Enter; Backspace and Delete edit the current line. Reads may return part of a completed line. The monitor and upload/guest transport use separate USB CDC interfaces. The script selects stable device identities automatically; use `--console-port DEVICE` and `--upload-port DEVICE` when needed. When multiple boards are connected, specify both devices for the same board. Console uses the interface ending in -if00; upload/guest uses -if02. Ordinary terminal software works on the monitor interface with local echo disabled; the second interface uses framed packets.
 
 Arming load or accepting BEGIN preserves the previous image. The first accepted nonempty DATA block invalidates it immediately. After that, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
 

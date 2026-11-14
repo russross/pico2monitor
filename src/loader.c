@@ -53,7 +53,7 @@ void loader_feed(uint32_t offset, const uint8_t *bytes, uint32_t count) {
         loader.destructive = true;
         loader.prefix = physical(GUEST_BASE);
         loader.upload = loader.prefix + ELF_PREFIX_SIZE;
-        console_printf("replacing previous SRAM image\r\n");
+        shell_notice("replacing previous SRAM image");
     }
     memcpy(loader.upload, bytes, count);
     loader.cursor += count;

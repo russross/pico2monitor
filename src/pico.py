@@ -9,6 +9,7 @@ import errno
 import fcntl
 import os
 import select
+import shlex
 import signal
 import struct
 import sys
@@ -34,6 +35,14 @@ class Kind(IntEnum):
     ACK = 6
     NAK = 7
     RESULT = 8
+    CLAIM = 9
+    ATTACHED = 10
+    INPUT = 11
+    OUTPUT = 12
+    RELEASE = 13
+    RELEASED = 14
+    PING = 15
+    ERROR = 16
 
 
 class UploadError(Exception):
@@ -105,6 +114,10 @@ class SerialPort:
         self.buffer = bytearray()
         self.console = console
         try:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise UploadError(f"serial interface already in use: {path}") from error
             attributes = termios.tcgetattr(self.fd)
             attributes[0] = attributes[1] = attributes[3] = 0
             attributes[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | termios.HUPCL
@@ -229,11 +242,18 @@ def read_image(path: Path, *, preflight: bool = True) -> bytes:
 
 
 def send_file(
-    path: Path, port_name: str, *, preflight: bool = True, console: SerialPort | None = None
+    path: Path,
+    port_name: str,
+    *,
+    preflight: bool = True,
+    console: SerialPort | None = None,
+    port: SerialPort | None = None,
 ) -> str:
     data = read_image(path, preflight=preflight)
     name = path.name.encode("ascii", errors="replace")[:63]
-    port = SerialPort(port_name, console)
+    owned = port is None
+    if port is None:
+        port = SerialPort(port_name, console)
     session: int | None = None
     try:
         try:
@@ -270,7 +290,8 @@ def send_file(
                 pass
         raise
     finally:
-        port.close()
+        if owned:
+            port.close()
 
 
 def discover_port(interface: str, option: str) -> str:
@@ -278,6 +299,22 @@ def discover_port(interface: str, option: str) -> str:
     if len(candidates) != 1:
         raise UploadError(f"specify {option} with the monitor's {interface} CDC device")
     return str(candidates[0])
+
+
+def check_port_pair(console_name: str, upload_name: str) -> None:
+    """Explicit device paths must still refer to the same USB board."""
+
+    def usb_device(name: str) -> Path | None:
+        device = Path("/sys/class/tty") / Path(name).resolve().name / "device"
+        for parent in device.resolve().parents:
+            if (parent / "idVendor").exists() and (parent / "idProduct").exists():
+                return parent
+        return None
+
+    console_device = usb_device(console_name)
+    upload_device = usb_device(upload_name)
+    if console_device is not None and upload_device is not None and console_device != upload_device:
+        raise UploadError("console and upload interfaces belong to different USB devices")
 
 
 def split_output(data: bytes) -> tuple[bytes, bytes, bool]:
@@ -317,19 +354,34 @@ def wait_console(port: SerialPort, marker: bytes) -> None:
 
 # Combined mode interrupts any current input or guest before arming the upload.
 # The console descriptor remains open through upload and interactive operation.
-def console_session(port_name: str, image: Path | None, upload_name: str | None) -> None:
+def console_session(
+    port_name: str,
+    image: Path | None,
+    upload_name: str | None,
+    load_options: list[str] | None = None,
+) -> None:
     attributes = termios.tcgetattr(sys.stdin.fileno())
     port = SerialPort(port_name)
+    uploader: SerialPort | None = None
     try:
-        tty.setraw(sys.stdin.fileno())
         if image is not None:
             if upload_name is None:
                 raise UploadError("upload port unavailable")
+            uploader = SerialPort(upload_name, port)
+        tty.setraw(sys.stdin.fileno())
+        if image is not None:
+            if upload_name is None or uploader is None:
+                raise UploadError("upload port unavailable")
             port.write(b"\x03")
             wait_console(port, b"pico> ")
-            port.write(b"load\r")
+            command = shlex.join(["load", *(load_options or [])]).encode()
+            if len(command) > 2304:
+                raise UploadError("load command exceeds 2304 bytes")
+            port.write(command + b"\r")
             wait_console(port, b"waiting for ELF")
-            send_file(image, upload_name, console=port)
+            send_file(image, upload_name, port=uploader)
+            uploader.close()
+            uploader = None
         pending = b""
         while True:
             ready = select.select([sys.stdin.fileno(), port.fd], [], [])[0]
@@ -345,7 +397,85 @@ def console_session(port_name: str, image: Path | None, upload_name: str | None)
                 port.write(data)
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attributes)
+        if uploader is not None:
+            uploader.close()
         port.close()
+
+
+def claim_guest(port: SerialPort, session: int) -> None:
+    """The claim retires upload RESULT replay only after the host received it."""
+    for _attempt in range(5):
+        port.write(Frame(Kind.CLAIM, session).encode())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                reply = port.receive(deadline - time.monotonic())
+            except TimeoutError:
+                break
+            if reply.session != session:
+                continue
+            if reply.kind == Kind.ATTACHED:
+                return
+            if reply.kind == Kind.ERROR:
+                message = reply.payload.decode("ascii", errors="replace")
+                if "idle monitor" not in message and "change pending" not in message:
+                    raise UploadError(message)
+                # Monitor load diagnostics and the final prompt may still be draining.
+                time.sleep(0.05)
+                break
+    raise UploadError("guest attachment timed out; suspend the guest and retry")
+
+
+def guest_session(port_name: str, image: Path | None = None) -> None:
+    attributes = termios.tcgetattr(sys.stdin.fileno())
+    port = SerialPort(port_name)
+    session = time.monotonic_ns()
+    attached = False
+    try:
+        tty.setraw(sys.stdin.fileno())
+        if image is not None:
+            message = send_file(image, port_name, port=port)
+            write_output(f"{image}: {message}; ready to run\r\n".encode())
+        claim_guest(port, session)
+        attached = True
+        write_output(b"Guest attached; Ctrl-] detaches. Ctrl-C/Escape suspends.\r\n")
+        heartbeat = 0.0
+        while True:
+            if time.monotonic() >= heartbeat:
+                port.write(Frame(Kind.PING, session).encode())
+                heartbeat = time.monotonic() + 1
+            if select.select([sys.stdin.fileno()], [], [], 0)[0]:
+                data = os.read(sys.stdin.fileno(), 128)
+                if not data or b"\x1d" in data:
+                    return
+                port.write(Frame(Kind.INPUT, session, payload=data).encode())
+            try:
+                reply = port.receive(0.05)
+            except TimeoutError:
+                continue
+            if reply.session != session:
+                continue
+            if reply.kind == Kind.OUTPUT:
+                write_output(reply.payload)
+            elif reply.kind == Kind.RELEASED:
+                attached = False
+                return
+            elif reply.kind == Kind.ERROR:
+                raise UploadError(reply.payload.decode("ascii", errors="replace"))
+    finally:
+        try:
+            if attached:
+                port.write(Frame(Kind.RELEASE, session).encode(), timeout=0.2)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    reply = port.receive(deadline - time.monotonic())
+                    if reply.session == session and reply.kind == Kind.RELEASED:
+                        break
+        except (OSError, TimeoutError, UploadError):
+            pass
+        finally:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, attributes)
+            port.close()
 
 
 def interrupted(number: int, frame: object) -> None:
@@ -354,40 +484,54 @@ def interrupted(number: int, frame: object) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument(
-        "--send", action="store_true", help="upload only; type load in the console first"
+        "--send", action="store_true", help="upload, then attach guest I/O; type load first"
     )
+    parser.add_argument("--attach", action="store_true", help="attach guest I/O without uploading")
+    parser.add_argument("--detach", action="store_true", help="exit after --send completes")
     parser.add_argument(
         "image", type=Path, nargs="?", help="ELF file to upload; omit for console only"
     )
     parser.add_argument("--console-port", help="console CDC device (first serial interface)")
     parser.add_argument("--upload-port", help="upload CDC device (second serial interface)")
-    arguments = parser.parse_args()
+    arguments, load_options = parser.parse_known_args()
     if arguments.send and arguments.image is None:
         parser.error("--send requires an image")
-    if not arguments.send and not sys.stdin.isatty():
-        parser.error("console mode requires an interactive terminal")
+    if arguments.attach and (arguments.send or arguments.image is not None):
+        parser.error("--attach cannot be combined with an image or --send")
+    if arguments.detach and not arguments.send:
+        parser.error("--detach requires --send")
+    if load_options and (arguments.send or arguments.image is None):
+        parser.error("load options require an image in combined console mode")
+    if not (arguments.send and arguments.detach) and not sys.stdin.isatty():
+        parser.error("interactive mode requires a terminal; use --send FILE --detach for scripts")
     signal.signal(signal.SIGTERM, interrupted)
     try:
         # Validate the local file before opening or interrupting the board.
         if arguments.image is not None:
             read_image(arguments.image)
         upload_name = None
-        if arguments.image is not None:
+        if arguments.image is not None or arguments.attach:
             upload_name = arguments.upload_port or discover_port("if02", "--upload-port")
-        if arguments.send:
+        if arguments.attach or (arguments.send and not arguments.detach):
+            if upload_name is None:
+                raise UploadError("guest port unavailable")
+            guest_session(upload_name, arguments.image)
+        elif arguments.send:
             if upload_name is None:
                 raise UploadError("upload port unavailable")
             message = send_file(arguments.image, upload_name)
             print(f"{arguments.image}: {message}; ready to run")
         else:
             console_name = arguments.console_port or discover_port("if00", "--console-port")
+            if upload_name is not None:
+                check_port_pair(console_name, upload_name)
             print(
                 "Connected; Ctrl-D or Ctrl-] detaches. Ctrl-C/Escape suspends the guest.",
                 flush=True,
             )
-            console_session(console_name, arguments.image, upload_name)
+            console_session(console_name, arguments.image, upload_name, load_options)
         return 0
     except (OSError, UploadError, TimeoutError) as error:
         print(f"pico: {error}", file=sys.stderr)

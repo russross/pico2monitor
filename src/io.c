@@ -1,4 +1,5 @@
 #include "monitor.h"
+#include "transfer.h"
 
 #include "tusb.h"
 
@@ -9,12 +10,12 @@
 typedef struct {
     uint32_t read, write;
 } OutputRing;
-static OutputRing output;
+static OutputRing output, guest_output;
 /* Only the payload occupies scratch SRAM; empty indices make old bytes inert. */
 static uint8_t output_bytes[4096] __attribute__((section(".monitor_output")));
 static uint8_t input[512];
 static uint32_t input_read, input_write, input_lost, output_lost;
-static bool was_connected, discard_batch;
+static bool was_connected;
 
 void io_init(void) {
     tusb_init();
@@ -26,10 +27,32 @@ bool upload_connected(void) {
     return tud_cdc_n_connected(1);
 }
 size_t console_space(void) {
-    return sizeof(output_bytes) - (output.write - output.read);
+    return 2048 - (output.write - output.read);
 }
 bool console_empty(void) {
-    return output.read == output.write && tud_cdc_n_write_available(0) == CFG_TUD_CDC_TX_BUFSIZE;
+    return output.read == output.write && (guest_attached() || guest_output_empty()) &&
+           tud_cdc_n_write_available(0) == CFG_TUD_CDC_TX_BUFSIZE;
+}
+void console_input_clear(void) {
+    tud_cdc_n_read_flush(0);
+}
+bool guest_output_empty(void) {
+    return guest_output.read == guest_output.write;
+}
+size_t guest_output_peek(const uint8_t **bytes) {
+    size_t position = guest_output.read % 2048;
+    size_t count = guest_output.write - guest_output.read;
+    if (count > 2048 - position)
+        count = 2048 - position;
+    *bytes = output_bytes + 2048 + position;
+    return count;
+}
+void guest_output_consume(size_t count) {
+    guest_output.read += count;
+}
+void guest_output_discard(size_t staged) {
+    output_lost += guest_output.write - guest_output.read + staged;
+    guest_output.read = guest_output.write;
 }
 
 size_t console_write(const void *bytes, size_t count) {
@@ -37,23 +60,22 @@ size_t console_write(const void *bytes, size_t count) {
     if (count > console_space())
         count = console_space();
     for (size_t i = 0; i < count; ++i)
-        output_bytes[output.write++ % sizeof(output_bytes)] = p[i];
+        output_bytes[output.write++ % 2048] = p[i];
     return count;
 }
 
 size_t guest_output_write(const void *bytes, size_t count) {
     /* Count guest bytes separately from the expanded terminal output. */
     const uint8_t *p = bytes;
-    size_t space = console_space();
-    space = space > 2048 ? space - 2048 : 0;
+    size_t space = 2048 - (guest_output.write - guest_output.read);
     size_t sent = 0;
     while (sent < count) {
         size_t needed = p[sent] == '\n' ? 2 : 1;
         if (space < needed)
             break;
         if (needed == 2)
-            console_write("\r", 1);
-        console_write(p + sent, 1);
+            output_bytes[2048 + guest_output.write++ % 2048] = '\r';
+        output_bytes[2048 + guest_output.write++ % 2048] = p[sent];
         space -= needed;
         ++sent;
     }
@@ -85,7 +107,7 @@ bool guest_input_put(uint8_t byte) {
         if (input_write != input_read && input[(input_write - 1) % sizeof(input)] != '\n' &&
             input[(input_write - 1) % sizeof(input)] != 4) {
             --input_write;
-            console_write("\b \b", 3);
+            guest_output_write("\b \b", 3);
         }
         return true;
     }
@@ -97,9 +119,9 @@ bool guest_input_put(uint8_t byte) {
     }
     input[input_write++ % sizeof(input)] = byte;
     if (byte == '\n')
-        console_write("\r\n", 2);
+        guest_output_write("\n", 1);
     else if (byte != 4)
-        console_write(&byte, 1);
+        guest_output_write(&byte, 1);
     return true;
 }
 int32_t guest_input_read(void *bytes, size_t count) {
@@ -124,9 +146,10 @@ int32_t guest_input_read(void *bytes, size_t count) {
 }
 
 void io_status(void) {
-    console_printf("io: input-dropped=%lu output-dropped=%lu queued=%lu\r\n",
-                   (unsigned long)input_lost, (unsigned long)output_lost,
-                   (unsigned long)(output.write - output.read));
+    console_printf(
+        "io: input-dropped=%lu output-dropped=%lu queued=%lu\r\n", (unsigned long)input_lost,
+        (unsigned long)output_lost,
+        (unsigned long)(output.write - output.read + guest_output.write - guest_output.read));
 }
 size_t upload_read(void *bytes, size_t count) {
     return tud_cdc_n_read(1, bytes, (uint32_t)count);
@@ -145,6 +168,8 @@ void io_service(void) {
         output_lost += output.write - output.read;
         output.read = output.write;
         tud_cdc_n_write_clear(0);
+        if (!guest_attached())
+            guest_output_discard(0);
         shell_disconnected();
     }
     if (!was_connected && connected)
@@ -152,32 +177,42 @@ void io_service(void) {
     was_connected = connected;
 
     /* Control keys precede ordinary input buffering, including under input pressure. */
-    uint8_t bytes[256];
-    uint32_t count = tud_cdc_n_read(0, bytes, sizeof(bytes));
-    discard_batch = false;
-    for (uint32_t i = 0; i < count && !discard_batch; ++i) {
+    for (unsigned i = 0; i < 256; ++i) {
         bool active = program.state == ACTIVE;
-        if (active && (bytes[i] == 3 || bytes[i] == 27)) {
-            program_suspend(bytes[i] == 3 ? "Ctrl-C" : "Escape");
-            discard_batch = true;
-        } else if (active)
-            guest_input_put(bytes[i]);
-        else {
-            shell_input(bytes[i]);
-            if (program.state == ACTIVE)
-                discard_batch = true;
-        }
+        bool combined = active && !guest_attached();
+        uint8_t byte;
+        bool urgent = active && tud_cdc_n_peek(0, &byte) && (byte == 3 || byte == 27);
+        if (!urgent &&
+            ((!combined && !transfer_active() && !shell_accepting()) || console_space() < 32))
+            break;
+        if (!tud_cdc_n_read(0, &byte, 1))
+            break;
+        if (active && (byte == 3 || byte == 27)) {
+            program_suspend(byte == 3 ? "Ctrl-C" : "Escape");
+            tud_cdc_n_read_flush(0);
+            break;
+        } else if (combined)
+            guest_input_put(byte);
+        else
+            shell_input(byte);
     }
 
     /* Endpoint writes are short and never wait for an absent terminal reader. */
     size_t pending = output.write - output.read;
     if (pending && connected) {
-        size_t position = output.read % sizeof(output_bytes);
-        if (pending > sizeof(output_bytes) - position)
-            pending = sizeof(output_bytes) - position;
+        size_t position = output.read % 2048;
+        if (pending > 2048 - position)
+            pending = 2048 - position;
         if (pending > 256)
             pending = 256;
         output.read += tud_cdc_n_write(0, output_bytes + position, (uint32_t)pending);
+    }
+    if (!pending && connected && !guest_attached()) {
+        const uint8_t *data;
+        size_t count = guest_output_peek(&data);
+        if (count > 256)
+            count = 256;
+        guest_output_consume(tud_cdc_n_write(0, data, (uint32_t)count));
     }
     tud_cdc_n_write_flush(0);
     tud_cdc_n_write_flush(1);

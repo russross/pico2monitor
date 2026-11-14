@@ -9,6 +9,20 @@ from pico import DETACH, Frame, Kind, SerialPort, UploadError, split_output
 
 
 class HostTests(unittest.TestCase):
+    def test_serial_owner_is_exclusive_and_released_on_close(self) -> None:
+        master, slave = pty.openpty()
+        name = os.ttyname(slave)
+        port = SerialPort(name)
+        try:
+            with self.assertRaisesRegex(UploadError, "already in use"):
+                SerialPort(name)
+            port.close()
+            port = SerialPort(name)
+        finally:
+            port.close()
+            os.close(master)
+            os.close(slave)
+
     def test_detach_sequence_fragmentation(self) -> None:
         for split in range(len(DETACH) + 1):
             output, pending, detached = split_output(b"hello" + DETACH[:split])

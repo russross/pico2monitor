@@ -45,7 +45,7 @@ On Linux, the script selects the USB serial interfaces automatically. It suspend
 
 `./pico` connects without uploading. Use `./pico --console-port DEVICE --upload-port DEVICE a.out` for explicit device selection, required on macOS and useful with multiple boards. On macOS, select the board's two `/dev/cu.usbmodem*` devices. On Linux, stable names end in `-if00` (console) and `-if02` (upload). Both must belong to the same board and be accessible to your user; the repository includes a [udev rule](https://github.com/russross/pico2monitor/blob/main/60-pico-monitor.rules). `./pico --help` lists options.
 
-For a separate upload, type `load` in an open console and run `./pico --send a.out` in another terminal. A failed transfer after replacement begins requires another upload.
+For a separate upload, type `load` in an open console and run `./pico --send a.out` in another terminal. The sender stays attached for guest I/O; add `--detach` to upload and exit. `./pico --attach` attaches guest I/O without uploading, while the guest is stopped. Type `run` or `resume` in the monitor. `suspend` stops the guest, `io` reports routing, and `io merge` merges it while stopped. Ctrl-] in the guest terminal or loss of its connection suspends and merges automatically. Merge before another process uploads through that interface. A failed transfer after replacement begins requires another upload. Combined mode forwards load options, for example `./pico a.out --no-reset`.
 
 
 Guest lifecycle and shell

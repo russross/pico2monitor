@@ -107,6 +107,11 @@ size_t console_write(const void *bytes, size_t count);
 size_t guest_output_write(const void *bytes, size_t count);
 size_t console_space(void);
 bool console_empty(void);
+void console_input_clear(void);
+bool guest_output_empty(void);
+size_t guest_output_peek(const uint8_t **bytes);
+void guest_output_consume(size_t count);
+void guest_output_discard(size_t staged);
 void console_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int32_t guest_input_read(void *bytes, size_t count);
 void guest_input_clear(void);
@@ -122,5 +127,9 @@ void shell_input(uint8_t byte);
 void shell_notice(const char *message);
 void shell_prompt(void);
 void shell_disconnected(void);
+bool shell_accepting(void);
+bool shell_idle(void);
+void shell_stopped(void);
+void shell_irq_masked(uint32_t number);
 
 #endif

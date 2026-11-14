@@ -56,7 +56,7 @@ void monitor_service_irqs(void) {
 #endif
         else {
             irq_set_enabled(number, false);
-            console_printf("\r\nmasked unexpected IRQ %lu\r\n", (unsigned long)number);
+            shell_irq_masked(number);
         }
     }
     __asm volatile("csrw 0xbe5, %0" ::"r"(context) : "memory");

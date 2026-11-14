@@ -28,6 +28,7 @@ static size_t in_count, in_cursor, out_count;
 static char console_text[16384];
 static size_t console_size, console_available = 8192;
 static bool capture_console;
+static bool console_online = true, upload_online = true;
 uint8_t *physical(uint32_t address) {
     assert(address >= 0x20000000 && address < 0x20082000);
     return ram + address - 0x20000000;
@@ -49,6 +50,33 @@ size_t console_space(void) {
     return console_available;
 }
 void shell_prompt(void) {}
+void shell_stopped(void) {}
+bool shell_idle(void) {
+    return true;
+}
+bool console_connected(void) {
+    return console_online;
+}
+bool console_empty(void) {
+    return true;
+}
+bool guest_output_empty(void) {
+    return true;
+}
+size_t guest_output_peek(const uint8_t **bytes) {
+    *bytes = NULL;
+    return 0;
+}
+void guest_output_consume(size_t count) {
+    assert(count == 0);
+}
+void guest_output_discard(size_t staged) {
+    (void)staged;
+}
+bool guest_input_put(uint8_t byte) {
+    (void)byte;
+    return true;
+}
 void shell_notice(const char *message) {
     (void)message;
 }
@@ -87,7 +115,7 @@ void console_printf(const char *format, ...) {
     console_size += (size_t)count;
 }
 bool upload_connected(void) {
-    return true;
+    return upload_online;
 }
 void upload_flush_input(void) {
     in_count = in_cursor = 0;
@@ -579,6 +607,90 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     frame = (WireFrame){.type = WIRE_ABORT, .session = response.session};
     response = request(&frame);
     assert(response.type == WIRE_RESULT && response.payload[0] == 1 && response.payload[1] == 1);
+    program.state = ACTIVE;
+    WireFrame claim = {.type = WIRE_CLAIM, .session = 123};
+    assert(request(&claim).type == WIRE_ERROR);
+    program.state = READY;
+    response = request(&frame);
+    assert(response.type == WIRE_RESULT && response.payload[0] == 1 && response.payload[1] == 1);
+}
+
+/* Ownership retries do not repeat transitions, and loss waits for both cores
+ * before redirecting guest I/O. The fake clock makes lease expiry deterministic. */
+static void guest_session_checks(const uint8_t *file, uint32_t size) {
+    program_forget();
+    WireFrame frame = {.type = WIRE_CLAIM, .session = 123};
+    assert(request(&frame).type == WIRE_ATTACHED && guest_attached());
+    assert(guest_take_notice().kind == GUEST_NOTICE_ATTACHED);
+    assert(request(&frame).type == WIRE_ATTACHED && guest_take_notice().kind == GUEST_NOTICE_NONE);
+    frame.session = 456;
+    assert(request(&frame).type == WIRE_ERROR && guest_attached());
+    program.state = ACTIVE;
+    program.threads[0].executing = program.threads[1].executing = true;
+    assert(guest_merge() != NULL);
+    now += UINT64_C(5000001);
+    transfer_step();
+    assert(program.state == STOPPING && guest_attached());
+    program.threads[0].executing = false;
+    program_step();
+    transfer_step();
+    assert(program.state == STOPPING && guest_attached());
+    program.threads[1].executing = false;
+    program_step();
+    assert(program.state == STOPPED);
+    transfer_step();
+    assert(!guest_attached() && guest_take_notice().kind == GUEST_NOTICE_MERGED);
+    assert(request(NULL).type == WIRE_RELEASED);
+    frame.session = 123;
+    assert(request(&frame).type == WIRE_ERROR);
+    WireFrame release = {.type = WIRE_RELEASE, .session = 123};
+    assert(request(&release).type == WIRE_RELEASED &&
+           guest_take_notice().kind == GUEST_NOTICE_NONE);
+    frame.session = 789;
+    assert(request(&frame).type == WIRE_ATTACHED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_ATTACHED);
+    assert(guest_merge() == NULL);
+    assert(request(NULL).type == WIRE_RELEASED);
+    assert(!guest_attached() && guest_take_notice().kind == GUEST_NOTICE_MERGED);
+    program_forget();
+
+    /* Recovery commits even if the monitor has not read the attachment notice.
+     * Both configuration changes remain queued in their original order. */
+    frame.session = 1000;
+    assert(request(&frame).type == WIRE_ATTACHED);
+    upload_online = false;
+    transfer_step();
+    assert(!guest_attached());
+    assert(guest_take_notice().kind == GUEST_NOTICE_ATTACHED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_MERGED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_NONE);
+    upload_online = true;
+    release.session = 1000;
+    assert(request(&release).type == WIRE_RELEASED);
+
+    /* A retained owner can upload through its descriptor, acknowledge RESULT,
+     * and return to guest traffic without another ownership change. */
+    frame.session = 2000;
+    assert(request(&frame).type == WIRE_ATTACHED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_ATTACHED);
+    transfer_arm(true);
+    WireFrame ready = request(NULL);
+    assert(ready.type == WIRE_READY);
+    assert(request(&frame).type == WIRE_ERROR && transfer_active());
+    WireFrame abort = {.type = WIRE_ABORT, .session = ready.session};
+    assert(request(&abort).type == WIRE_RESULT);
+    assert(request(&frame).type == WIRE_ATTACHED);
+    transfer_checks(file, size);
+    assert(guest_attached() && request(&frame).type == WIRE_ATTACHED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_NONE);
+    assert(guest_merge() == NULL);
+    assert(request(NULL).type == WIRE_RELEASED);
+    assert(guest_take_notice().kind == GUEST_NOTICE_MERGED);
+    program_forget();
+    console_online = false;
+    frame.session = 3000;
+    assert(request(&frame).type == WIRE_ERROR && !guest_attached());
+    console_online = true;
 }
 
 /* A synthetic map exercises exact ELF edges within PMP granules, overlapping
@@ -809,10 +921,11 @@ int main(int argc, char **argv) {
     flexible_checks();
     solver_oracle();
     transfer_checks(file, (uint32_t)length);
+    guest_session_checks(file, (uint32_t)length);
     assert(!memory_map_busy());
     map_checks();
     thread_checks();
     free(file);
-    puts("native checks: ELF rejection, streaming, reset, framing, retries, cancellation passed");
+    puts("native checks: ELF rejection, streaming, reset, framing, retries, guest sessions passed");
     return 0;
 }

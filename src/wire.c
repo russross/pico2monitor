@@ -84,7 +84,7 @@ bool wire_decode(uint8_t *input, size_t size, WireFrame *frame) {
     }
 
     /* All lengths are checked before a decoded payload reaches a consumer. */
-    if (out < 24 || input[0] != 1 || input[1] < WIRE_READY || input[1] > WIRE_RESULT)
+    if (out < 24 || input[0] != 1 || input[1] < WIRE_READY || input[1] > WIRE_ERROR)
         return false;
     uint16_t count = read_le16(input + 18);
     if (count > WIRE_PAYLOAD || out != (size_t)count + 24)

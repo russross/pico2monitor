@@ -15,11 +15,53 @@ static struct {
     TransferState state;
     uint64_t session, deadline, ready_at;
     uint32_t sequence, offset, file_size, expected_crc, running_crc, last_crc;
-    bool previous_connected, ack_pending, overflow, reset;
+    bool previous_connected, ack_pending, overflow, reset, report_pending, result_preserved;
     size_t input_size, output_size, output_cursor;
+    uint16_t guest_output_pending;
     uint8_t input[WIRE_LIMIT], output[192];
     WireFrame frame;
 } transfer;
+
+/* Upload and guest frames share storage; ownership survives program replacement. */
+static struct {
+    uint64_t session, deadline;
+    GuestNotice notice, next_notice;
+    const char *release_reason;
+    bool attached, releasing;
+} guest;
+
+bool guest_attached(void) {
+    return guest.attached;
+}
+bool guest_transport_idle(void) {
+    return guest_output_empty() && transfer.output_cursor == transfer.output_size;
+}
+bool guest_handoff_pending(void) {
+    return guest.releasing || guest.notice.kind != GUEST_NOTICE_NONE;
+}
+GuestNotice guest_take_notice(void) {
+    GuestNotice notice = guest.notice;
+    guest.notice = guest.next_notice;
+    guest.next_notice = (GuestNotice){0};
+    return notice;
+}
+void guest_disconnect(const char *reason) {
+    if (!guest.attached || guest.releasing)
+        return;
+    guest.releasing = true;
+    guest.release_reason = reason;
+    program_suspend(reason);
+}
+const char *guest_merge(void) {
+    if (!guest.attached)
+        return NULL;
+    if (program.state == ACTIVE || program.state == STOPPING || !program_quiescent())
+        return "suspend the guest before merging I/O";
+    if (!guest_transport_idle())
+        return "guest output is draining; retry io merge";
+    guest_disconnect("guest terminal merged");
+    return NULL;
+}
 
 bool transfer_active(void) {
     return transfer.state == TRANSFER_ARMED || transfer.state == TRANSFER_DATA ||
@@ -31,6 +73,71 @@ static void send_frame(const WireFrame *frame) {
     transfer.output_cursor = 0;
 }
 
+static void guest_reply(WireType type, uint64_t session, const char *message) {
+    WireFrame frame = {.type = type,
+                       .session = session,
+                       .payload = (const uint8_t *)message,
+                       .length = message ? (uint16_t)strlen(message) : 0};
+    send_frame(&frame);
+}
+
+/* A claim acknowledges the final upload result and retires its replay buffer. */
+static bool guest_accept(const WireFrame *frame) {
+    if (frame->type == WIRE_CLAIM) {
+        const char *error = NULL;
+        if (!frame->session || frame->length)
+            error = "invalid guest claim";
+        else if (guest.attached && guest.session != frame->session)
+            error = "guest I/O already attached";
+        else if (!guest.attached && guest.session == frame->session)
+            error = "guest session expired";
+        else if (guest.releasing || (!guest.attached && guest.notice.kind != GUEST_NOTICE_NONE))
+            error = "I/O change pending";
+        else if (guest.attached && transfer_active())
+            error = "upload in progress";
+        else if (!guest.attached &&
+                 (transfer_active() || program.reset_busy || program.state == ACTIVE ||
+                  program.state == STOPPING || !program_quiescent() || !shell_idle() ||
+                  !console_connected() || !console_empty() || !guest_output_empty()))
+            error = "guest claim requires an idle monitor and suspended guest";
+        if (error) {
+            guest_reply(WIRE_ERROR, frame->session, error);
+            return true;
+        }
+        if (!guest.attached) {
+            guest.session = frame->session;
+            guest.attached = true;
+            guest_input_clear();
+            guest.notice = (GuestNotice){.kind = GUEST_NOTICE_ATTACHED};
+        }
+        transfer.state = TRANSFER_OFF;
+        guest.deadline = monitor_time_us() + UINT64_C(5000000);
+        guest_reply(WIRE_ATTACHED, guest.session, NULL);
+        return true;
+    }
+    if (frame->type < WIRE_INPUT)
+        return false;
+    if (!guest.attached || frame->session != guest.session) {
+        if (frame->type == WIRE_RELEASE && guest.session && frame->session == guest.session)
+            guest_reply(WIRE_RELEASED, frame->session, NULL);
+        return true;
+    }
+    guest.deadline = monitor_time_us() + UINT64_C(5000000);
+    if (frame->type == WIRE_RELEASE)
+        guest_disconnect("guest terminal detached");
+    else if (frame->type == WIRE_INPUT && !transfer_active() && !guest.releasing &&
+             program.state == ACTIVE) {
+        for (unsigned i = 0; i < frame->length; ++i) {
+            if (frame->payload[i] == 3 || frame->payload[i] == 27) {
+                program_suspend(frame->payload[i] == 3 ? "Ctrl-C" : "Escape");
+                break;
+            }
+            guest_input_put(frame->payload[i]);
+        }
+    }
+    return true;
+}
+
 static void reply(WireType type) {
     WireFrame frame = {.type = type,
                        .session = transfer.session,
@@ -39,10 +146,10 @@ static void reply(WireType type) {
     send_frame(&frame);
 }
 
-static void result(void) {
+static void encode_result(void) {
     uint8_t payload[162];
     payload[0] = loader.error != NULL;
-    payload[1] = !loader.destructive && program.valid;
+    payload[1] = transfer.result_preserved;
     const char *message = loader.error ? loader.error : "loaded";
     size_t length = strlen(message);
     if (length > 160)
@@ -54,12 +161,17 @@ static void result(void) {
                        .offset = transfer.offset,
                        .payload = payload,
                        .length = (uint16_t)(length + 2)};
-    transfer.state = TRANSFER_DONE;
-    transfer.ack_pending = false;
     send_frame(&frame);
+}
+
+bool transfer_report(void) {
+    if (!transfer.report_pending)
+        return false;
+    transfer.report_pending = false;
     if (loader.error)
         console_printf("load failed: %s (%s)\r\n", loader.error,
-                       payload[1] ? "previous image preserved" : "no runnable image");
+                       transfer.result_preserved ? "previous image preserved"
+                                                 : "no runnable image");
     else {
         const MemoryPlan *p = &program.image.plan;
         console_printf(
@@ -69,6 +181,15 @@ static void result(void) {
             (unsigned long)((p->stack_top - p->stack_base) / 1024),
             p->snapshot ? "available" : "unavailable");
     }
+    return true;
+}
+
+static void result(void) {
+    transfer.state = TRANSFER_DONE;
+    transfer.ack_pending = false;
+    transfer.result_preserved = !loader.destructive && program.valid;
+    transfer.report_pending = true;
+    encode_result();
     shell_prompt();
 }
 
@@ -121,12 +242,14 @@ static void begin(const WireFrame *frame) {
 }
 
 static void accept(const WireFrame *frame) {
+    if (guest_accept(frame))
+        return;
     if (frame->session != transfer.session)
         return;
     if (transfer.state == TRANSFER_DONE) {
-        /* The final encoded result remains cached until the next arm operation. */
+        /* Rebuild RESULT if an intervening control reply reused its encoded storage. */
         if (frame->type == WIRE_END || frame->type == WIRE_ABORT)
-            transfer.output_cursor = 0;
+            encode_result();
         return;
     }
     if (!transfer_active())
@@ -186,6 +309,30 @@ static void accept(const WireFrame *frame) {
 
 void transfer_step(void) {
     bool connected = upload_connected();
+    if (guest.attached &&
+        (!connected || !console_connected() || monitor_time_us() >= guest.deadline))
+        guest_disconnect(!connected             ? "guest connection lost"
+                         : !console_connected() ? "monitor connection lost"
+                                                : "guest heartbeat expired");
+    if (guest.releasing && program_quiescent() && program.state != STOPPING) {
+        transfer_cancel("guest terminal disconnected during upload");
+        guest_output_discard(transfer.guest_output_pending);
+        transfer.guest_output_pending = 0;
+        guest_input_clear();
+        guest.attached = guest.releasing = false;
+        GuestNotice notice = {.kind = GUEST_NOTICE_MERGED, .reason = guest.release_reason};
+        if (guest.notice.kind != GUEST_NOTICE_NONE)
+            guest.next_notice = notice;
+        else
+            guest.notice = notice;
+        transfer.state = TRANSFER_OFF;
+        transfer.input_size = 0;
+        transfer.overflow = false;
+        upload_flush_input();
+        transfer.output_size = transfer.output_cursor = 0;
+        if (connected)
+            guest_reply(WIRE_RELEASED, guest.session, NULL);
+    }
     if (transfer.previous_connected && !connected)
         transfer_cancel("upload port disconnected");
     transfer.previous_connected = connected;
@@ -202,6 +349,8 @@ void transfer_step(void) {
     if (transfer.output_cursor < transfer.output_size && connected) {
         transfer.output_cursor += upload_write(transfer.output + transfer.output_cursor,
                                                transfer.output_size - transfer.output_cursor);
+        if (transfer.output_cursor == transfer.output_size)
+            transfer.guest_output_pending = 0;
     }
     if (transfer.output_cursor < transfer.output_size || transfer.ack_pending)
         return;
@@ -227,5 +376,22 @@ void transfer_step(void) {
             transfer.input[transfer.input_size++] = byte;
         } else
             transfer.overflow = true;
+    }
+    /* Guest output uses the upload reply buffer only after the upload phase ends. */
+    if (guest.attached && !guest.releasing && transfer.state == TRANSFER_OFF &&
+        transfer.output_cursor == transfer.output_size) {
+        const uint8_t *bytes;
+        size_t count = guest_output_peek(&bytes);
+        if (count > 128)
+            count = 128;
+        if (count) {
+            WireFrame frame = {.type = WIRE_OUTPUT,
+                               .session = guest.session,
+                               .payload = bytes,
+                               .length = (uint16_t)count};
+            send_frame(&frame);
+            transfer.guest_output_pending = (uint16_t)count;
+            guest_output_consume(count);
+        }
     }
 }

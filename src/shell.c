@@ -10,6 +10,10 @@ static bool line_overflow;
 static char *args[34];
 static unsigned pending_argc;
 static bool run_pending;
+static bool command_pending, stopped_pending, redrawing;
+static size_t redraw_cursor;
+static const char *notice;
+static uint64_t masked_irqs;
 
 static void detach(void) {
     static const char sequence[] = "\033]pico-console;detach\007";
@@ -20,13 +24,34 @@ void shell_prompt(void) {
     prompt_pending = true;
     length = 0;
     line_overflow = false;
+    redrawing = false;
+    redraw_cursor = 0;
 }
 void shell_notice(const char *message) {
-    console_printf("\r\nsuspended: %s\r\n", message);
-    shell_prompt();
+    notice = message;
+}
+void shell_stopped(void) {
+    if (!guest_attached())
+        console_input_clear();
+    stopped_pending = true;
+}
+void shell_irq_masked(uint32_t number) {
+    masked_irqs |= UINT64_C(1) << number;
+}
+bool shell_idle(void) {
+    return !command_pending && !run_pending && !memory_map_busy() && !transfer_active() &&
+           !program.reset_busy && !stopped_pending && !notice && !redrawing && !masked_irqs &&
+           length == 0;
+}
+bool shell_accepting(void) {
+    return !command_pending && !run_pending && !prompt_pending && !memory_map_busy() &&
+           !program.reset_busy && !stopped_pending && !notice && !redrawing &&
+           !guest_handoff_pending() && !masked_irqs && program.state != STOPPING;
 }
 void shell_disconnected(void) {
     run_pending = false;
+    command_pending = false;
+    guest_disconnect("monitor connection lost");
     program_suspend("console disconnected");
     transfer_cancel("USB console disconnected");
     length = 0;
@@ -62,6 +87,10 @@ static void info(void) {
         for (unsigned i = 0; i < 2; ++i) {
             const GuestThread *thread = &program.threads[i];
             static const char *const names[] = {"unused", "runnable", "blocked"};
+            if (thread->executing) {
+                console_printf("thread %u: executing\r\n", i);
+                continue;
+            }
             console_printf("thread %u: %s pc=%08lx sp=%08lx cpu-us=%llu\r\n", i,
                            names[thread->state], (unsigned long)thread->frame.pc,
                            (unsigned long)thread->frame.x[2], (unsigned long long)thread->cpu_us);
@@ -129,6 +158,9 @@ static const CommandHelp commands[] = {
      "Suspended or faulted programs require explicit reset."},
     {"resume", "resume", "Resume a suspended program",
      "Continue from the saved program state and pending system call."},
+    {"suspend", "suspend", "Suspend both guest threads", "Preserve guest state for resume."},
+    {"io", "io [merge]", "Show or merge guest I/O",
+     "Merge a separate guest terminal while suspended; pico --attach splits I/O."},
     {"reset", "reset", "Reset the loaded program",
      "Restore the program for another run; requires reset support retained at load time."},
     {"bootsel", "bootsel", "Reboot into USB boot mode",
@@ -163,8 +195,21 @@ static void execute(void) {
     }
     const char *error = NULL;
     if (strcmp(line, "run") != 0 && strcmp(line, "load") != 0 && strcmp(line, "help") != 0 &&
-        argc != 1) {
+        strcmp(line, "io") != 0 && argc != 1) {
         console_printf("unexpected command arguments\r\n");
+        shell_prompt();
+        return;
+    }
+    if (program.state == ACTIVE && strcmp(line, "help") && strcmp(line, "info") &&
+        strcmp(line, "map") && strcmp(line, "suspend") && strcmp(line, "io") &&
+        strcmp(line, "quit")) {
+        console_printf("suspend the guest before this command\r\n");
+        shell_prompt();
+        return;
+    }
+    if (guest_handoff_pending() && (!strcmp(line, "run") || !strcmp(line, "resume") ||
+                                    !strcmp(line, "load") || !strcmp(line, "reset"))) {
+        console_printf("I/O change pending\r\n");
         shell_prompt();
         return;
     }
@@ -177,9 +222,22 @@ static void execute(void) {
         memory_map_start();
     else if (strcmp(line, "info") == 0)
         info();
-    else if (strcmp(line, "load") == 0) {
+    else if (strcmp(line, "io") == 0) {
+        if (argc == 1)
+            console_printf("io: %s\r\n", guest_attached() ? "split" : "combined");
+        else if (argc == 2 && !strcmp(args[1], "merge"))
+            error = guest_merge();
+        else
+            error = "usage: io [merge]";
+    } else if (strcmp(line, "suspend") == 0) {
+        program_suspend("monitor request");
+        if (program.state == STOPPING)
+            return;
+    } else if (strcmp(line, "load") == 0) {
         if (argc > 2 || (argc == 2 && strcmp(args[1], "--no-reset")))
             error = "usage: load [--no-reset]";
+        else if (guest_attached() && !guest_transport_idle())
+            error = "guest output is draining; retry load";
         else {
             transfer_arm(argc == 1);
             return;
@@ -205,13 +263,18 @@ static void execute(void) {
             }
         }
         error = program_launch((unsigned)argc - 1, (const char *const *)(args + 1));
-        if (!error)
+        if (!error) {
+            if (guest_attached())
+                shell_prompt();
             return;
+        }
     } else if (strcmp(line, "resume") == 0) {
         if (program.state != STOPPED)
             console_printf("resume requires a suspended program\r\n");
         else {
             program_resume();
+            if (guest_attached())
+                shell_prompt();
             return;
         }
     } else if (strcmp(line, "quit") == 0) {
@@ -235,7 +298,7 @@ void shell_input(uint8_t byte) {
             transfer_cancel("cancelled from console");
         return;
     }
-    if (program.reset_busy || prompt_pending || program.state == STOPPING)
+    if (!shell_accepting())
         return;
     if (byte == '\n' && swallow_lf) {
         swallow_lf = false;
@@ -262,8 +325,7 @@ void shell_input(uint8_t byte) {
         }
         line[length] = 0;
         console_printf("\r\n");
-        execute();
-        length = 0;
+        command_pending = true;
     } else if (byte >= 32 && byte < 127) {
         if (length < sizeof(line) - 1) {
             line[length++] = (char)byte;
@@ -274,6 +336,15 @@ void shell_input(uint8_t byte) {
 }
 
 void shell_step(void) {
+    /* Shell operations begin only after their command echo and prior output drain. */
+    if (!console_connected() || !console_empty())
+        return;
+    if (command_pending) {
+        command_pending = false;
+        execute();
+        length = 0;
+        return;
+    }
     /* Reset completion requests a prompt; a queued run consumes that request
      * before starting the guest with the retained command arguments. */
     if (run_pending && !program.reset_busy) {
@@ -282,14 +353,80 @@ void shell_step(void) {
         if (error) {
             console_printf("%s\r\n", error);
             shell_prompt();
-        } else
+        } else if (guest_attached())
+            shell_prompt();
+        else
             prompt_pending = false;
+        return;
     }
-    memory_map_step();
-    if (prompt_pending && console_connected() && console_empty() && !program.reset_busy &&
-        !memory_map_busy() && program.state != ACTIVE && !transfer_active() &&
-        program.state != STOPPING && program_quiescent()) {
+    if (memory_map_busy()) {
+        memory_map_step();
+        return;
+    }
+    if (masked_irqs) {
+        unsigned number = (unsigned)__builtin_ctzll(masked_irqs);
+        masked_irqs &= ~(UINT64_C(1) << number);
+        console_printf("\r\nmasked unexpected IRQ %u\r\n", number);
+        redrawing = false;
+        prompt_pending = true;
+        return;
+    }
+    if (notice) {
+        console_printf("\r\n%s\r\n", notice);
+        notice = NULL;
+        redrawing = false;
+        prompt_pending = true;
+        return;
+    }
+    if (transfer_report())
+        return;
+    /* Stop diagnostics and routing notices share the shell's output fence. A partial
+     * command remains stored and is redrawn in bounded pieces after the notice. */
+    if (stopped_pending) {
+        stopped_pending = false;
+        redrawing = false;
+        if (program.state == STOPPED && !guest_handoff_pending())
+            console_printf("\r\nsuspended: %s\r\n", program.stop_reason);
+        else if (program.state == FAULTED) {
+            const GuestFrame *f = &program.threads[program.fault_thread].frame;
+            console_printf("\r\nguest fault: cause=%lu pc=%08lx sp=%08lx thread=%u "
+                           "(fault address unavailable)\r\n",
+                           (unsigned long)f->cause, (unsigned long)f->pc, (unsigned long)f->x[2],
+                           program.fault_thread);
+        } else if (program.state == EXITED && program.exit_status)
+            console_printf("\r\nexit: %ld\r\n", (long)program.exit_status);
+        prompt_pending = true;
+        return;
+    }
+    if (!program.reset_busy && !transfer_active() && program.state != STOPPING) {
+        GuestNotice change = guest_take_notice();
+        if (change.kind != GUEST_NOTICE_NONE) {
+            redrawing = false;
+            if (change.kind == GUEST_NOTICE_ATTACHED)
+                console_printf("\r\nio: split; guest terminal attached\r\n");
+            else
+                console_printf("\r\nio: combined; guest %s; %s\r\n",
+                               program.state == STOPPED ? "suspended" : program_state_name(),
+                               change.reason);
+            prompt_pending = true;
+            return;
+        }
+    }
+    if (redrawing) {
+        size_t count = length - redraw_cursor;
+        if (count > 128)
+            count = 128;
+        console_write(line + redraw_cursor, count);
+        redraw_cursor += count;
+        redrawing = redraw_cursor < length;
+        return;
+    }
+    if (prompt_pending && !program.reset_busy && (program.state != ACTIVE || guest_attached()) &&
+        !transfer_active() && program.state != STOPPING &&
+        (guest_attached() || program_quiescent())) {
         console_printf("pico> ");
         prompt_pending = false;
+        redraw_cursor = 0;
+        redrawing = length != 0;
     }
 }

@@ -89,19 +89,7 @@ static void finish_stop(void) {
     if (program.state != STOPPING || !program_quiescent())
         return;
     program.state = program.stop_target;
-    if (program.state == STOPPED)
-        shell_notice(program.stop_reason);
-    else {
-        if (program.state == FAULTED) {
-            const GuestFrame *f = &program.threads[program.fault_thread].frame;
-            console_printf("\r\nguest fault: cause=%lu pc=%08lx sp=%08lx thread=%u "
-                           "(fault address unavailable)\r\n",
-                           (unsigned long)f->cause, (unsigned long)f->pc, (unsigned long)f->x[2],
-                           program.fault_thread);
-        } else if (program.exit_status)
-            console_printf("\r\nexit: %ld\r\n", (long)program.exit_status);
-        shell_prompt();
-    }
+    shell_stopped();
 }
 
 void program_suspend(const char *reason) {

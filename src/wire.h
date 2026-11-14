@@ -16,7 +16,15 @@ typedef enum {
     WIRE_ABORT,
     WIRE_ACK,
     WIRE_NAK,
-    WIRE_RESULT
+    WIRE_RESULT,
+    WIRE_CLAIM,
+    WIRE_ATTACHED,
+    WIRE_INPUT,
+    WIRE_OUTPUT,
+    WIRE_RELEASE,
+    WIRE_RELEASED,
+    WIRE_PING,
+    WIRE_ERROR
 } WireType;
 /* Payload storage is borrowed; encoding consumes it synchronously. */
 typedef struct {
