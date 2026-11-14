@@ -10,9 +10,13 @@ PROBES := $(addprefix build/probe,$(addsuffix .elf,1 2 3 4 5 6 7 8 9 10 11 12))
 NATIVE_SOURCES := memory launch map elf wire loader program transfer
 C_FILES := $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
 PY_FILES := $(wildcard src/*.py scripts/*.py tests/*.py)
+VERSION := $(strip $(file <VERSION))
+RELEASE_BUNDLE := dist/pico2monitor-$(VERSION).tar.gz
 
 .PHONY: all deps firmware guests emulator check native-check emulator-check panic-check format format-check flash install-udev clean
 all: dist/monitor.uf2 dist/pico guests build/emulator
+.PHONY: release
+release: $(RELEASE_BUNDLE)
 deps:
 	./scripts/setup-deps.py
 
@@ -30,6 +34,12 @@ dist/monitor.uf2: build/monitor.uf2 | dist
 	cp $< $@
 dist/pico: src/pico.py | dist
 	cp $< $@
+
+# Package the protected firmware with the end-user quickstart.
+dist/README.md: RELEASE.md | dist
+	cp $< $@
+$(RELEASE_BUNDLE): dist/monitor.uf2 dist/pico dist/README.md VERSION Makefile
+	tar -czf $@ -C dist monitor.uf2 pico README.md
 
 guests: $(GUESTS) $(PROBES)
 build/hello.elf build/echo.elf build/loop.elf build/exit23.elf: tests/guest_demo.c $(GUEST_COMMON) | build deps

@@ -1,0 +1,78 @@
+name: Release
+
+on: push
+
+permissions:
+  contents: write
+
+# Serialize publication across branches for each shared version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check version tag
+        id: version
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid VERSION: $version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          git ls-remote --tags --refs --exit-code "https://github.com/$GH_REPO.git" "refs/tags/$tag" && status=0 || status=$?
+          case "$status" in
+            0) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            2) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Tag lookup failed ($status)" >&2; exit "$status" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "bundle=dist/pico2monitor-$version.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Install build and check tools
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libclang-cpp19 libllvm19
+      - uses: astral-sh/setup-uv@v6
+        if: steps.version.outputs.exists == 'false'
+        with:
+          python-version: '3.13'
+      - name: Build
+        if: steps.version.outputs.exists == 'false'
+        run: make
+      - name: Check
+        if: steps.version.outputs.exists == 'false'
+        run: make check
+      - name: Bundle
+        if: steps.version.outputs.exists == 'false'
+        run: make release
+      - name: Upload draft and publish
+        if: steps.version.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          BUNDLE: ${{ steps.version.outputs.bundle }}
+        shell: bash
+        run: |
+          # Retry interrupted uploads only for the same version and commit.
+          drafts=$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$TAG\") | [.draft, .target_commitish] | @tsv")
+          if [[ -n "$drafts" ]]; then
+            if [[ "$drafts" != $'true\t'"$GITHUB_SHA" ]]; then
+              echo "Release $TAG already exists for another commit or is published" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "Pico 2 monitor $TAG" --notes-file RELEASE.md
+          fi
+          gh release upload "$TAG" "$BUNDLE" dist/monitor.uf2 dist/pico dist/README.md --clobber
+          # Publishing creates the tag after all assets have uploaded.
+          gh release edit "$TAG" --draft=false
