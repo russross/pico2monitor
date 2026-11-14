@@ -7,26 +7,32 @@ Program program;
 
 const char *program_state_name(ProgramState state) {
     static const char *const names[] = {"empty",   "ready",  "running", "waiting",
-                                        "stopped", "exited", "faulted"};
+                                        "stopped", "exited", "faulted", "stopping"};
     return names[state];
 }
 
+bool program_quiescent(void) {
+    return !program.threads[0].executing && !program.threads[1].executing;
+}
+
 void program_forget(void) {
+    if (!program_quiescent())
+        monitor_panic("forgetting an executing guest");
     pmp_disable();
     memset(&program, 0, sizeof(program));
     guest_input_clear();
 }
 
+/* Only the initial thread receives the exec stack. New threads establish their
+ * own stack and runtime registers in guest code. */
 static void initial_frame(void) {
-    monitor_fence_i();
-    memset(&program.frame, 0, sizeof(program.frame));
-    program.frame.pc = program.image.entry;
-    program.frame.x[2] = program.image.plan.stack_top;
+    memset(program.threads, 0, sizeof(program.threads));
+    program.threads[0].frame.pc = program.image.entry;
+    program.threads[0].frame.x[2] = program.image.plan.stack_top;
     program.current_break = program.image.plan.heap_base;
-    program.pending = (PendingCall){0};
     program.exit_status = 0;
     program.stop_reason = NULL;
-    program.cpu_us = 0;
+    program.next_order = 0;
     program.state = READY;
     guest_input_clear();
 }
@@ -38,16 +44,18 @@ void program_install(const Image *image) {
 }
 
 void program_reset(void) {
-    if (!program.valid || program.reset_busy || !program.image.plan.snapshot)
+    if (!program.valid || program.reset_busy || !program.image.plan.snapshot ||
+        !program_quiescent())
         return;
     pmp_disable();
     program.reset_busy = true;
     program.reset_cursor = 0;
-    program.pending = (PendingCall){0};
+    for (unsigned i = 0; i < 2; ++i)
+        program.threads[i].pending = (PendingCall){0};
     guest_input_clear();
 }
 
-bool guest_range(uint32_t address, uint32_t size, bool writable) {
+static bool guest_access(uint32_t address, uint32_t size, uint8_t required) {
     if (!program.valid)
         return false;
     if (size == 0)
@@ -58,7 +66,6 @@ bool guest_range(uint32_t address, uint32_t size, bool writable) {
     if (address < p->heap_limit && address + size > program.current_break &&
         address + size > p->heap_base)
         return false;
-    uint8_t required = writable ? PERM_W : PERM_R;
     uint32_t end = address + size;
     for (uint32_t a = address & ~31u; a < end; a += 32)
         if (!(memory_permissions(p, a) & required))
@@ -66,210 +73,310 @@ bool guest_range(uint32_t address, uint32_t size, bool writable) {
     return true;
 }
 
+bool guest_range(uint32_t address, uint32_t size, bool writable) {
+    return guest_access(address, size, writable ? PERM_W : PERM_R);
+}
+
+/* STOPPING closes both guest return paths before exposing stopped memory to
+ * shell commands. Each core acknowledges by entering with its saved frame. */
+static void finish_stop(void) {
+    if (program.state != STOPPING || !program_quiescent())
+        return;
+    program.state = program.stop_target;
+    if (program.state == STOPPED)
+        shell_notice(program.stop_reason);
+    else {
+        if (program.state == FAULTED) {
+            const GuestFrame *f = &program.threads[program.fault_thread].frame;
+            console_printf("\r\nguest fault: cause=%lu pc=%08lx sp=%08lx thread=%u "
+                           "(fault address unavailable)\r\n",
+                           (unsigned long)f->cause, (unsigned long)f->pc, (unsigned long)f->x[2],
+                           program.fault_thread);
+        } else if (program.exit_status)
+            console_printf("\r\nexit: %ld\r\n", (long)program.exit_status);
+        shell_prompt();
+    }
+}
+
 void program_suspend(const char *reason) {
     if (program.state != RUNNING && program.state != WAITING)
         return;
     program.stopped_state = program.state;
-    program.state = STOPPED;
+    program.state = STOPPING;
+    program.stop_target = STOPPED;
     program.stop_reason = reason;
     guest_input_clear();
-    shell_notice(reason);
+    finish_stop();
 }
 
-static void complete_call(int32_t result) {
-    program.frame.x[10] = (uint32_t)result;
-    program.pending = (PendingCall){0};
-    program.state = RUNNING;
-}
-
-static void poll_call(void) {
-    PendingCall *call = &program.pending;
-    uint32_t count = call->count < IO_CHUNK ? call->count : IO_CHUNK;
-    if (call->kind == CALL_READ) {
-        int32_t got = guest_input_read(physical(call->address), count);
-        if (got >= 0)
-            complete_call(got);
-    } else if (call->kind == CALL_WRITE) {
-        size_t sent = guest_output_write(physical(call->address), count);
-        call->address += (uint32_t)sent;
-        call->count -= (uint32_t)sent;
-        call->written += (uint32_t)sent;
-        if (!call->count)
-            complete_call((int32_t)call->written);
-    } else if (call->kind == CALL_SLEEP && monitor_time_us() >= call->deadline) {
-        complete_call(0);
+void program_resume(void) {
+    if (program.state == STOPPED) {
+        program.state = program.stopped_state;
+        guest_input_clear();
     }
 }
 
-static void syscall_dispatch(void) {
-    GuestFrame *f = &program.frame;
+static void complete_call(GuestThread *thread, int32_t result) {
+    thread->frame.x[10] = (uint32_t)result;
+    thread->pending = (PendingCall){0};
+    thread->state = THREAD_RUNNABLE;
+}
+
+static bool first_call(const GuestThread *thread) {
+    for (unsigned i = 0; i < 2; ++i) {
+        const GuestThread *other = &program.threads[i];
+        if (other->state == THREAD_BLOCKED && other->pending.kind == thread->pending.kind &&
+            other->pending.order < thread->pending.order)
+            return false;
+    }
+    return true;
+}
+
+/* Requests are serviced by either core. Rechecking each bounded copy also
+ * accounts for a concurrent thread shrinking the shared logical heap. */
+static void poll_call(GuestThread *thread) {
+    PendingCall *call = &thread->pending;
+    uint32_t count = call->count < IO_CHUNK ? call->count : IO_CHUNK;
+    if (call->kind == CALL_READ || call->kind == CALL_WRITE) {
+        if (call->kind == CALL_READ && !first_call(thread))
+            return;
+        if (!guest_range(call->address, count, call->kind == CALL_READ)) {
+            complete_call(thread, -14);
+            return;
+        }
+        if (call->kind == CALL_READ) {
+            int32_t got = guest_input_read(physical(call->address), count);
+            if (got >= 0)
+                complete_call(thread, got);
+        } else {
+            size_t sent = guest_output_write(physical(call->address), count);
+            call->address += (uint32_t)sent;
+            call->count -= (uint32_t)sent;
+            call->written += (uint32_t)sent;
+            if (!call->count)
+                complete_call(thread, (int32_t)call->written);
+        }
+    } else if (call->kind == CALL_SLEEP && monitor_time_us() >= call->deadline)
+        complete_call(thread, 0);
+    else if (call->kind == CALL_BRK && first_call(thread)) {
+        uint32_t target = call->address;
+        if (!call->written)
+            call->count = program.current_break;
+        if (target <= call->count) {
+            program.current_break = target;
+            complete_call(thread, (int32_t)target);
+            return;
+        }
+        uint32_t bytes = target - call->count;
+        if (bytes > 1024)
+            bytes = 1024;
+        memset(physical(call->count), 0, bytes);
+        call->count += bytes;
+        call->written = 1;
+        if (call->count == target) {
+            program.current_break = target;
+            complete_call(thread, (int32_t)target);
+        }
+    }
+}
+
+static void block_call(GuestThread *thread, PendingCall call) {
+    call.order = ++program.next_order;
+    thread->pending = call;
+    thread->state = THREAD_BLOCKED;
+}
+
+static void end_program(ProgramState target) {
+    program.state = STOPPING;
+    program.stop_target = target;
+    for (unsigned i = 0; i < 2; ++i)
+        program.threads[i].pending = (PendingCall){0};
+    finish_stop();
+}
+
+/* Creation publishes a completely initialized vacant slot under the monitor
+ * lock. No guest stack, TLS pointer, or return address is manufactured. */
+static int32_t thread_create(unsigned core, uint32_t pc, uint32_t parameter) {
+    unsigned slot = core ^ 1u;
+    GuestThread *thread = &program.threads[slot];
+    if (thread->state != THREAD_UNUSED || thread->executing)
+        return -11;
+    if ((pc & 1) || !guest_access(pc, 2, PERM_X))
+        return -14;
+    memset(thread, 0, sizeof(*thread));
+    thread->frame.pc = pc;
+    thread->frame.x[10] = parameter;
+    thread->state = THREAD_RUNNABLE;
+    return (int32_t)slot;
+}
+
+static void syscall_dispatch(unsigned core) {
+    GuestThread *thread = &program.threads[core];
+    GuestFrame *f = &thread->frame;
     uint32_t number = f->x[17], fd = f->x[10], address = f->x[11], count = f->x[12];
     f->pc += 4;
     if (number == SYS_EXIT || number == SYS_EXIT_GROUP) {
         program.exit_status = (int32_t)fd;
-        program.state = EXITED;
-        if (program.exit_status != 0)
-            console_printf("\r\nexit: %ld\r\n", (long)program.exit_status);
-        shell_prompt();
+        thread->state = THREAD_UNUSED;
+        thread->pending = (PendingCall){0};
+        if (number == SYS_EXIT_GROUP || program.threads[core ^ 1u].state == THREAD_UNUSED)
+            end_program(EXITED);
+        return;
+    }
+    if (number == SYS_THREAD_CREATE) {
+        complete_call(thread, thread_create(core, fd, address));
         return;
     }
     if (number == SYS_READ || number == SYS_WRITE) {
-        if ((number == SYS_READ && fd != 0) || (number == SYS_WRITE && fd != 1 && fd != 2)) {
-            complete_call(-9);
-        } else if (count > INT32_MAX) {
-            complete_call(-22);
-        } else if (!guest_range(address, count, number == SYS_READ)) {
-            complete_call(-14);
-        } else if (!count) {
-            complete_call(0);
-        } else {
-            program.pending = (PendingCall){.kind = number == SYS_READ ? CALL_READ : CALL_WRITE,
-                                            .address = address,
-                                            .count = count};
-            program.state = WAITING;
-            poll_call();
+        if ((number == SYS_READ && fd != 0) || (number == SYS_WRITE && fd != 1 && fd != 2))
+            complete_call(thread, -9);
+        else if (count > INT32_MAX)
+            complete_call(thread, -22);
+        else if (!guest_range(address, count, number == SYS_READ))
+            complete_call(thread, -14);
+        else if (!count)
+            complete_call(thread, 0);
+        else {
+            block_call(thread, (PendingCall){.kind = number == SYS_READ ? CALL_READ : CALL_WRITE,
+                                             .address = address,
+                                             .count = count});
+            poll_call(thread);
         }
         return;
     }
 
-    /* Waiting operations retain arguments as data, never as kernel stack frames. */
+    /* Heap changes are queued in request order, so two growing requests cannot
+     * clear or publish overlapping logical allocations independently. */
     if (number == SYS_YIELD)
-        complete_call(0);
+        complete_call(thread, 0);
     else if (number == SYS_BRK) {
         const MemoryPlan *p = &program.image.plan;
-        if (fd >= p->heap_base && fd <= p->heap_limit) {
-            if (fd > program.current_break) {
-                program.pending = (PendingCall){.kind = CALL_BRK,
-                                                .address = program.current_break,
-                                                .count = fd - program.current_break};
-                program.state = WAITING;
-                return;
-            }
-            program.current_break = fd;
-        }
-        complete_call((int32_t)program.current_break);
+        if (fd >= p->heap_base && fd <= p->heap_limit)
+            block_call(thread, (PendingCall){.kind = CALL_BRK, .address = fd});
+        else
+            complete_call(thread, (int32_t)program.current_break);
     } else if (number == SYS_CLOCK_GETTIME64) {
         if (fd != 1)
-            complete_call(-22);
+            complete_call(thread, -22);
         else if (!guest_range(address, 16, true))
-            complete_call(-14);
+            complete_call(thread, -14);
         else {
             uint64_t us = monitor_time_us();
             int64_t times[2] = {(int64_t)(us / 1000000), (int64_t)(us % 1000000) * 1000};
             memcpy(physical(address), times, sizeof(times));
-            complete_call(0);
+            complete_call(thread, 0);
         }
     } else if (number == SYS_CLOCK_NANOSLEEP64) {
         if (fd != 1 || address != 0)
-            complete_call(-22);
+            complete_call(thread, -22);
         else if (!guest_range(count, 16, false))
-            complete_call(-14);
+            complete_call(thread, -14);
         else {
             int64_t times[2];
             memcpy(times, physical(count), sizeof(times));
             uint64_t now = monitor_time_us();
             if (times[0] < 0 || times[1] < 0 || times[1] >= 1000000000 ||
                 (uint64_t)times[0] > (UINT64_MAX - now - 1000000) / 1000000)
-                complete_call(-22);
-            else {
-                program.pending = (PendingCall){.kind = CALL_SLEEP,
-                                                .deadline = now + (uint64_t)times[0] * 1000000 +
-                                                            ((uint64_t)times[1] + 999) / 1000};
-                program.state = WAITING;
-            }
+                complete_call(thread, -22);
+            else
+                block_call(thread, (PendingCall){.kind = CALL_SLEEP,
+                                                 .deadline = now + (uint64_t)times[0] * 1000000 +
+                                                             ((uint64_t)times[1] + 999) / 1000});
         }
     } else
-        complete_call(-38);
+        complete_call(thread, -38);
 }
 
-void program_after_trap(void) {
-    uint32_t cause = program.frame.cause;
-    if (cause & UINT32_C(0x80000000))
-        return;
-    bool syscall = cause == 8;
+/* Trap frames become monitor-owned only when their core acquires the lock.
+ * Syscalls arriving during suspension stay unconsumed until resume. */
+void program_after_trap(unsigned core) {
+    GuestThread *thread = &program.threads[core];
+    thread->executing = false;
+    thread->cpu_us += monitor_time_us() - thread->entered_at;
+    thread->trap_pending = true;
+    uint32_t cause = thread->frame.cause;
+    if (!(cause & UINT32_C(0x80000000)) && cause != 8
 #ifdef MONITOR_EMULATOR
-    /* rp2350js has no U-mode: only this explicitly labeled test build accepts M ecalls. */
-    syscall = syscall || cause == 11;
+        && cause != 11
 #endif
-    if (syscall) {
-        syscall_dispatch();
-        return;
+    ) {
+        thread->trap_pending = false;
+        program.fault_thread = core;
+        end_program(FAULTED);
     }
-    program.state = FAULTED;
-    program.pending = (PendingCall){0};
-    console_printf("\r\nguest fault: cause=%lu pc=%08lx sp=%08lx (fault address unavailable)\r\n",
-                   (unsigned long)cause, (unsigned long)program.frame.pc,
-                   (unsigned long)program.frame.x[2]);
-    shell_prompt();
+    finish_stop();
+}
+
+static void reset_step(void) {
+    const Image *image = &program.image;
+    const MemoryPlan *p = &image->plan;
+    uint32_t begin = GUEST_BASE + program.reset_cursor;
+    uint32_t end = begin + 1024;
+    if (end > GUEST_END)
+        end = GUEST_END;
+    /* Initialized overlaps win over zero-fill. Restarts restore writable
+     * initializers while clearing BSS and transient SRAM. */
+    for (uint32_t a = begin; a < end; ++a) {
+        if (a >= p->snapshot_base)
+            continue;
+        bool initialized = false;
+        uint32_t restore = 0;
+        for (uint32_t i = 0; i < image->segment_count; ++i) {
+            const Segment *s = &image->segments[i];
+            if (range_contains(s->address, s->file_size, a, 1)) {
+                initialized = true;
+                if (p->snapshot && (s->permissions & PERM_W))
+                    restore = p->snapshot_base + memory_snapshot_offset(image, i) + a - s->address;
+            }
+        }
+        if (restore)
+            *physical(a) = *physical(restore);
+        else if (!initialized) {
+            bool image_memory = false, writable = false;
+            for (uint32_t i = 0; i < image->segment_count; ++i) {
+                const Segment *s = &image->segments[i];
+                if (range_contains(s->address, s->memory_size, a, 1)) {
+                    image_memory = true;
+                    writable = writable || (s->permissions & PERM_W);
+                }
+            }
+            if (!image_memory || writable)
+                *physical(a) = 0;
+        }
+    }
+    program.reset_cursor += end - begin;
+    if (end == GUEST_END) {
+        program.reset_busy = false;
+        initial_frame();
+        shell_prompt();
+    }
 }
 
 void program_step(void) {
+    finish_stop();
     if (program.reset_busy) {
-        const Image *image = &program.image;
-        const MemoryPlan *p = &image->plan;
-        uint32_t begin = GUEST_BASE + program.reset_cursor;
-        uint32_t end = begin + 1024;
-        if (end > GUEST_END)
-            end = GUEST_END;
-        /* Initialized overlaps win over zero-fill. Restarts restore writable
-         * initializers while clearing BSS and transient SRAM. */
-        for (uint32_t a = begin; a < end; ++a) {
-            if (a >= p->snapshot_base)
-                continue;
-            bool initialized = false;
-            uint32_t restore = 0;
-            for (uint32_t i = 0; i < image->segment_count; ++i) {
-                const Segment *s = &image->segments[i];
-                if (range_contains(s->address, s->file_size, a, 1)) {
-                    initialized = true;
-                    if (p->snapshot && (s->permissions & PERM_W))
-                        restore =
-                            p->snapshot_base + memory_snapshot_offset(image, i) + a - s->address;
-                }
-            }
-            if (restore)
-                *physical(a) = *physical(restore);
-            else if (!initialized) {
-                bool image_memory = false, writable = false;
-                for (uint32_t i = 0; i < image->segment_count; ++i) {
-                    const Segment *s = &image->segments[i];
-                    if (range_contains(s->address, s->memory_size, a, 1)) {
-                        image_memory = true;
-                        writable = writable || (s->permissions & PERM_W);
-                    }
-                }
-                if (!image_memory || writable)
-                    *physical(a) = 0;
-            }
-        }
-        program.reset_cursor += end - begin;
-        if (end == GUEST_END) {
-            program.reset_busy = false;
-            initial_frame();
-            shell_prompt();
-        }
+        reset_step();
         return;
     }
-    if (program.state == WAITING && program.pending.kind == CALL_BRK) {
-        PendingCall *call = &program.pending;
-        uint32_t count = call->count < 1024 ? call->count : 1024;
-        memset(physical(call->address), 0, count);
-        call->address += count;
-        call->count -= count;
-        if (!call->count) {
-            program.current_break = call->address;
-            complete_call((int32_t)program.current_break);
-        }
-    } else if (program.state == WAITING)
-        poll_call();
-    if (program.state != RUNNING)
+    if (program.state != RUNNING && program.state != WAITING)
         return;
-
-    /* Every return services the host before allowing another guest instruction slice. */
-    pmp_enable(&program.image.plan);
-    uint64_t start = monitor_time_us();
-    guest_enter(&program.frame);
-    program.cpu_us += monitor_time_us() - start;
-    pmp_disable();
-    program_after_trap();
+    for (unsigned i = 0; i < 2; ++i) {
+        GuestThread *thread = &program.threads[i];
+        bool dispatched = false;
+        if (thread->trap_pending) {
+            thread->trap_pending = false;
+            if (!(thread->frame.cause & UINT32_C(0x80000000))) {
+                syscall_dispatch(i);
+                dispatched = true;
+            }
+        }
+        if (program.state != RUNNING && program.state != WAITING)
+            return;
+        if (thread->state == THREAD_BLOCKED && !dispatched)
+            poll_call(thread);
+    }
+    program.state =
+        program.threads[0].state == THREAD_RUNNABLE || program.threads[1].state == THREAD_RUNNABLE
+            ? RUNNING
+            : WAITING;
 }

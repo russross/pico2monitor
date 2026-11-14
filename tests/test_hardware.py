@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from test_exec import check_exec
+from test_exec import check_exec, check_threads
 
 from pico_send import SerialPort, UploadError, send_file
 
@@ -56,9 +56,11 @@ def require(condition: bool, message: str) -> None:
 
 def run(board: Hardware) -> None:
     banner = board.until(b"pico> ")
-    require(b"U-mode guests" in banner and b"EMULATOR" not in banner, "not the protected monitor")
+    require(b"U-mode threads" in banner and b"EMULATOR" not in banner, "not the protected monitor")
     print(banner.decode(errors="replace"), end="", flush=True)
     check_exec(board)
+    check_threads(board)
+    print("thread creation, replacement, suspension, reset, and faults: passed", flush=True)
     print("default-linker ELF, arguments, brk, and load-time reset policy: passed", flush=True)
     board.load("hello.elf")
     for attempt in range(2):

@@ -23,7 +23,7 @@ void pmp_disable(void) {
 #endif
 }
 
-void pmp_init(void) {
+void pmp_core_init(void) {
 #ifndef MONITOR_EMULATOR
     PMP_TRACE(1);
     pmp_disable();
@@ -38,6 +38,12 @@ void pmp_init(void) {
     __asm volatile("csrw 0xbd0, zero\ncsrw mcounteren, zero" ::: "memory");
     PMP_TRACE(6);
 
+#endif
+}
+
+void pmp_init(void) {
+    pmp_core_init();
+#ifndef MONITOR_EMULATOR
     /* ACCESSCTRL requires its write key even for read/modify/write operations.
      * Shared SRAM banks stay NSU-accessible; PMP selects the guest's addresses. */
     const uint32_t access_key = UINT32_C(0xacce0000);

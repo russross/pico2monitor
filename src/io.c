@@ -8,10 +8,11 @@
 
 typedef struct {
     uint32_t read, write;
-    uint8_t bytes[8192];
 } OutputRing;
 static OutputRing output;
-static uint8_t input[2048];
+/* Only the payload occupies scratch SRAM; empty indices make old bytes inert. */
+static uint8_t output_bytes[4096] __attribute__((section(".monitor_output")));
+static uint8_t input[512];
 static uint32_t input_read, input_write, input_lost, output_lost;
 static bool was_connected, discard_batch;
 
@@ -25,7 +26,7 @@ bool upload_connected(void) {
     return tud_cdc_n_connected(1);
 }
 size_t console_space(void) {
-    return sizeof(output.bytes) - (output.write - output.read);
+    return sizeof(output_bytes) - (output.write - output.read);
 }
 bool console_empty(void) {
     return output.read == output.write && tud_cdc_n_write_available(0) == CFG_TUD_CDC_TX_BUFSIZE;
@@ -36,7 +37,7 @@ size_t console_write(const void *bytes, size_t count) {
     if (count > console_space())
         count = console_space();
     for (size_t i = 0; i < count; ++i)
-        output.bytes[output.write++ % sizeof(output.bytes)] = p[i];
+        output_bytes[output.write++ % sizeof(output_bytes)] = p[i];
     return count;
 }
 
@@ -171,12 +172,12 @@ void io_service(void) {
     /* Endpoint writes are short and never wait for an absent terminal reader. */
     size_t pending = output.write - output.read;
     if (pending && connected) {
-        size_t position = output.read % sizeof(output.bytes);
-        if (pending > sizeof(output.bytes) - position)
-            pending = sizeof(output.bytes) - position;
+        size_t position = output.read % sizeof(output_bytes);
+        if (pending > sizeof(output_bytes) - position)
+            pending = sizeof(output_bytes) - position;
         if (pending > 256)
             pending = 256;
-        output.read += tud_cdc_n_write(0, output.bytes + position, (uint32_t)pending);
+        output.read += tud_cdc_n_write(0, output_bytes + position, (uint32_t)pending);
     }
     tud_cdc_n_write_flush(0);
     tud_cdc_n_write_flush(1);

@@ -7,7 +7,7 @@ static bool file_range(uint32_t offset, uint32_t count, uint32_t size) {
     return offset <= size && count <= size - offset;
 }
 
-const char *elf_validate(const uint8_t *p, uint32_t size, Image *image) {
+const char *elf_decode(const uint8_t *p, uint32_t size, Image *image) {
     if (size < 52 || size > ELF_FILE_LIMIT)
         return "file size outside ELF limits";
     if (memcmp(p, "\177ELF", 4) || p[4] != 1 || p[5] != 1 || p[6] != 1 || p[7] || p[8])
@@ -78,5 +78,10 @@ const char *elf_validate(const uint8_t *p, uint32_t size, Image *image) {
     }
     if (!entry)
         return "entry is not in initialized executable text";
-    return memory_plan_build(image, image->plan.requested);
+    return NULL;
+}
+
+const char *elf_validate(const uint8_t *p, uint32_t size, Image *image) {
+    const char *error = elf_decode(p, size, image);
+    return error ? error : memory_plan_build(image, image->plan.requested);
 }

@@ -5,6 +5,7 @@
 typedef enum {
     LOAD_IDLE,
     LOAD_HEADERS,
+    LOAD_PLAN,
     LOAD_STREAM,
     LOAD_DISCARD,
     LOAD_CLEAR,
@@ -15,6 +16,7 @@ typedef struct {
     LoadState state;
     Image image;
     uint32_t cursor, work_cursor;
+    uint32_t replay_target, replay_prefix, replay_count;
     uint8_t *prefix, *upload;
     const char *error;
     bool destructive;

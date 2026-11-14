@@ -17,8 +17,8 @@ static struct {
     uint32_t sequence, offset, file_size, expected_crc, running_crc, last_crc;
     bool previous_connected, ack_pending, overflow, reset;
     size_t input_size, output_size, output_cursor;
-    uint8_t input[WIRE_LIMIT], output[WIRE_LIMIT];
-    WireFrame frame, result;
+    uint8_t input[WIRE_LIMIT], output[192];
+    WireFrame frame;
 } transfer;
 
 bool transfer_active(void) {
@@ -27,7 +27,7 @@ bool transfer_active(void) {
 }
 
 static void send_frame(const WireFrame *frame) {
-    transfer.output_size = wire_encode(frame, transfer.output);
+    transfer.output_size = wire_encode(frame, transfer.output, sizeof(transfer.output));
     transfer.output_cursor = 0;
 }
 
@@ -40,26 +40,26 @@ static void reply(WireType type) {
 }
 
 static void result(void) {
-    WireFrame *frame = &transfer.result;
-    memset(frame, 0, sizeof(*frame));
-    frame->type = WIRE_RESULT;
-    frame->session = transfer.session;
-    frame->sequence = transfer.sequence;
-    frame->offset = transfer.offset;
-    frame->payload[0] = loader.error != NULL;
-    frame->payload[1] = !loader.destructive && program.valid;
+    uint8_t payload[162];
+    payload[0] = loader.error != NULL;
+    payload[1] = !loader.destructive && program.valid;
     const char *message = loader.error ? loader.error : "loaded";
     size_t length = strlen(message);
     if (length > 160)
         length = 160;
-    memcpy(frame->payload + 2, message, length);
-    frame->length = (uint16_t)(length + 2);
+    memcpy(payload + 2, message, length);
+    WireFrame frame = {.type = WIRE_RESULT,
+                       .session = transfer.session,
+                       .sequence = transfer.sequence,
+                       .offset = transfer.offset,
+                       .payload = payload,
+                       .length = (uint16_t)(length + 2)};
     transfer.state = TRANSFER_DONE;
     transfer.ack_pending = false;
-    send_frame(frame);
+    send_frame(&frame);
     if (loader.error)
         console_printf("load failed: %s (%s)\r\n", loader.error,
-                       frame->payload[1] ? "previous image preserved" : "no runnable image");
+                       payload[1] ? "previous image preserved" : "no runnable image");
     else {
         console_printf("loaded: %s; ready\r\n", program.image.name);
         memory_map_start();
@@ -119,8 +119,9 @@ static void accept(const WireFrame *frame) {
     if (frame->session != transfer.session)
         return;
     if (transfer.state == TRANSFER_DONE) {
+        /* The final encoded result remains cached until the next arm operation. */
         if (frame->type == WIRE_END || frame->type == WIRE_ABORT)
-            send_frame(&transfer.result);
+            transfer.output_cursor = 0;
         return;
     }
     if (!transfer_active())

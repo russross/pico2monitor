@@ -1,7 +1,7 @@
 Preparing and running executables
 =================================
 
-This monitor runs one assembly or freestanding C program on a Pico 2's RISC-V core. It supplies a small Linux-style userspace: static executables, a startup stack, console syscalls, and a brk heap. Programs link to physical SRAM addresses and use only the supported syscalls.
+This monitor runs one assembly or freestanding C program with up to two threads on a Pico 2's RISC-V cores. It supplies a small Linux-style userspace: static executables, an initial startup stack, console syscalls, and a shared brk heap. Programs link to physical SRAM addresses and use only the supported syscalls.
 
 The monitor and hardware resources are always protected. Protections inside the guest sandbox are best effort: the monitor protects text, constants, stack boundaries, and other memory when PMP entries permit it. A bad access inside the sandbox may succeed. Use `map` to inspect the actual permissions for your image.
 
@@ -14,7 +14,7 @@ Build an assembly program
     ./deps/toolchain/bin/riscv32-pico-elf-gcc \
         -march=rv32imac_zicsr_zifencei -mabi=ilp32 \
         -nostdlib -static -fno-pie -no-pie \
-        -Wl,-Ttext-segment=0x20020000,-e,_start \
+        -Wl,-Ttext-segment=0x20000000,-e,_start \
         tests/hello.S -o hello.elf
 
 `make build/assembly.elf` builds the same example with debug information. `make build/exec.elf` builds `tests/guest_exec.c` using the supplied startup and helper functions, also with the default linker script. `tests/guest.ld` remains a fixed-layout regression fixture for older demonstrations and protection probes; new programs do not need it.
@@ -25,9 +25,9 @@ Inspect a file before uploading:
 
 Check ELF32, little endian, RISC-V, EXEC, and the entry address. The monitor loads PT_LOAD program headers, not individual sections. FileSiz is initialized content; MemSiz also includes zero-filled memory. Debug information and other non-loadable metadata occupy transfer bytes but no guest SRAM.
 
-The recommended base is 0x20020000. Flash firmware accepts load destinations from 0x20018000; the SRAM-executing monitor requires 0x20020000 or higher. The upper bound is 0x20080000, with space below it needed for a 16 KiB stack and optional snapshots. `map` reports the final layout. Link addresses are not relocated during loading.
+The stable recommended base is 0x20000000, the start of SRAM. Higher load addresses remain supported. Firmware executes from flash and reserves 0x2007c000..0x20080000 for monitor static storage; its output ring and shared stack occupy scratch SRAM above that range. Guest segments, heap, the 16 KiB initial stack, and optional protected snapshots share 496 KiB below the monitor boundary. Future monitor budgets may change the upper limit without changing the recommended link address. `map` reports the final layout. Link addresses are not relocated during loading.
 
-Files must be static little-endian ELF32 RISC-V ET_EXEC using soft-float ILP32. Compressed instructions are supported. Floating-point ABI, RV32E, dynamic linking, TLS, and executable-stack requests are unsupported. Unsupported instructions fault during execution. There may be at most sixteen program headers, all within the first 4096 bytes. Files may be 52 bytes through 1 MiB; a valid executable normally needs more than the minimum header. Stripped files and loadable headers are supported.
+Files must be static little-endian ELF32 RISC-V ET_EXEC using soft-float ILP32. Compressed instructions are supported. Floating-point ABI, RV32E, dynamic linking, ELF TLS program headers, and executable-stack requests are unsupported. Unsupported instructions fault during execution. There may be at most sixteen program headers, all within the first 4096 bytes. Files may be 52 bytes through 1 MiB; a valid executable normally needs more than the minimum header. Stripped files and loadable headers are supported.
 
 Multiple load segments, arbitrary ordering, and RWX segments are allowed. Overlapping initialized destinations must name identical source file bytes. There is no requirement to split text, constants, and data into predetermined slots.
 
@@ -45,7 +45,7 @@ Guest console output translates LF to CRLF. Input is echoed and buffered until E
 
 Arming load or accepting BEGIN preserves the previous image. The first accepted nonempty DATA block invalidates it immediately. After that, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
 
-Zero exit is silent; nonzero exit prints its status. Faults show the cause, PC, and SP. The chip does not supply a reliable faulting address. Exited or faulted programs require reset before another run. Infinite loops can still be suspended by the monitor timer.
+The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. Exited or faulted programs require reset before another run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
 
 
 Arguments
@@ -78,12 +78,13 @@ Put the syscall number in a7 and arguments in a0 through a5, then execute ecall.
 | ------ | ---- | -------------------------------- |
 | 63 | read | a0=0, a1=buffer, a2=count; waits for console input |
 | 64 | write | a0=1 or 2, a1=buffer, a2=count; console output |
-| 93 | exit | a0=status; ends execution |
-| 94 | exit_group | Same behavior as exit |
+| 93 | exit | a0=status; ends the calling thread; the last exit ends the program |
+| 94 | exit_group | a0=status; ends both threads |
 | 124 | sched_yield | No arguments |
 | 214 | brk | a0=requested end; zero queries current break |
 | 403 | clock_gettime64 | a0=1 (CLOCK_MONOTONIC), a1=timespec pointer |
 | 407 | clock_nanosleep_time64 | a0=1, a1=0 (relative), a2=request timespec, a3 ignored |
+| 1000 | thread_create | a0=start PC, a1=parameter; returns the new slot number, 0 or 1 |
 
 Timespec contains two signed 64-bit little-endian integers: seconds and nanoseconds. Nanoseconds must be in 0..999999999. Monotonic time is board uptime; suspension preserves an outstanding sleep's deadline. Absolute sleeps and other clock IDs return -EINVAL. Relative sleeps are rounded upward to microseconds. The remaining-time argument is unused because this environment has no signal interruption.
 
@@ -92,6 +93,20 @@ Reads may return fewer bytes than requested, currently at most 256 per completio
 brk returns the resulting break, not a negative errno. An invalid request returns the unchanged break. The heap begins after the highest load segment; `brk(0)` discovers it without linker symbols. Growth zeroes newly allocated bytes, including bytes exposed again after shrinking. Growth cannot cross the reported heap limit. Syscall buffers may use heap bytes only below the current break; PMP may permit direct loads/stores beyond that logical limit. Reset returns the break to its initial value.
 
 A freestanding C runtime can use `tests/guest.h` and `tests/guest.c`. A general static libc may need additional syscalls, initialization, or TLS; static linkage alone does not establish compatibility. Binaries using this project's former private syscall numbers must be rebuilt.
+
+
+Threads
+-------
+
+Thread creation is a runtime choice and requires no load option, special ELF metadata, or additional monitor-reserved guest stack. The initial thread occupies slot 0 on core 0. Creation uses the other core's vacant slot; if both slots are occupied it returns -EAGAIN (-11). Either thread may exit first, and the survivor can repeatedly create replacements. There is no join operation or retained per-thread exit record.
+
+The new thread starts at the supplied PC with the parameter in a0. Every other integer register is zero, including sp, gp, tp, and ra. An odd or inaccessible entry PC, or one without effective execute permission, returns -EFAULT (-14). The monitor does not manufacture a return address or check guest-designated stack and TLS layouts.
+
+A guest entry shim normally obtains its stack pointer and other startup information through a0, establishes sp and any required gp/tp, calls its intended function, and invokes exit if the function returns. The guest can allocate a stack from shared memory or split the initial stack. Stack alignment, overlap avoidance, storage lifetime, and synchronization belong to the guest. `tests/guest_threads.S` demonstrates raw entry, explicit stack setup, and replacement after the initial thread exits.
+
+Both threads share all guest memory, effective PMP permissions, heap state, and console descriptors. Stack guards are best-effort debugging aids rather than isolation between threads. Concurrent reads consume input in request order; writes may interleave at bounded service boundaries. Heap changes complete in request order. Pending console copies revalidate each chunk against the current break, so shrinking a buffer out from under a pending call can cause -EFAULT after some output has already been queued. Guest code must coordinate shared data and buffer lifetimes.
+
+Either core can advance either thread's pending requests while it owns the monitor lock. A runnable thread resumes only on its own core. Each core checks progress through its local timer, with deadlines normally at most 1 ms ahead. No cross-core wakeup interrupt is required.
 
 
 Reset and memory pressure

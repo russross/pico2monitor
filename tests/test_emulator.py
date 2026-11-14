@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
-from test_exec import check_exec
+from test_exec import check_exec, check_threads
 
 from pico_send import Frame, Kind, SerialPort, UploadError, exchange, send_file
 
@@ -111,6 +111,9 @@ class MonitorTests(unittest.TestCase):
     def test_exec_contract(self) -> None:
         check_exec(self.emulator)
 
+    def test_threads(self) -> None:
+        check_threads(self.emulator)
+
     def test_execution_and_repeatable_reset(self) -> None:
         e = self.emulator
         e.load("hello.elf")
@@ -184,6 +187,22 @@ class MonitorTests(unittest.TestCase):
         self.assertIn(b"\x1b]pico-console;detach\x07", e.command("quit"))
         e.console.write(b"\x04")
         e.until(b"\x1b]pico-console;detach\x07")
+
+    def test_input_pressure_preserves_suspend_and_fresh_input(self) -> None:
+        e = self.emulator
+        e.load("echo.elf")
+        e.console.write(b"run\r")
+        e.until(b"returns to the monitor\r\n")
+        e.console.write(b"x" * 1024 + b"\x1b")
+        self.assertIn(b"suspended: Escape", e.until(b"pico> "))
+        self.assertNotIn(b"input-dropped=0 ", e.command("info"))
+        e.console.write(b"resume\r")
+        time.sleep(0.02)
+        e.console.write(b"fresh\r")
+        e.until(b"fresh\r\n")
+        e.until(b"fresh\r\n")
+        e.console.write(b"\x1b")
+        e.until(b"pico> ")
 
     def test_infinite_guest_is_preemptible(self) -> None:
         e = self.emulator

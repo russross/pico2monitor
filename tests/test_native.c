@@ -1,5 +1,6 @@
 #include "elf.h"
 #include "loader.h"
+#include "syscall.h"
 #include "transfer.h"
 #include "wire.h"
 
@@ -18,10 +19,11 @@
 /* The native memory array retains physical offsets and detects every bad loader write. */
 static uint8_t ram[520 * 1024];
 static uint64_t now;
-static bool simulate_guest;
 static size_t guest_output_credit = SIZE_MAX, guest_output_count;
 static uint8_t guest_output[2048];
 static uint8_t incoming[8192], outgoing[8192];
+static uint8_t read_bytes[8];
+static size_t read_count, read_cursor;
 static size_t in_count, in_cursor, out_count;
 uint8_t *physical(uint32_t address) {
     assert(address >= 0x20000000 && address < 0x20082000);
@@ -43,19 +45,19 @@ void monitor_panic(const char *message) {
 size_t console_space(void) {
     return 8192;
 }
-void guest_enter(GuestFrame *frame) {
-    assert(simulate_guest);
-    frame->cause = UINT32_C(0x80000007);
-}
 void shell_prompt(void) {}
 void shell_notice(const char *message) {
     (void)message;
 }
 void guest_input_clear(void) {}
 int32_t guest_input_read(void *bytes, size_t count) {
-    (void)bytes;
-    (void)count;
-    return -1;
+    if (read_cursor == read_count)
+        return -1;
+    if (count > read_count - read_cursor)
+        count = read_count - read_cursor;
+    memcpy(bytes, read_bytes + read_cursor, count);
+    read_cursor += count;
+    return (int32_t)count;
 }
 size_t console_write(const void *bytes, size_t count) {
     (void)bytes;
@@ -94,7 +96,7 @@ size_t upload_write(const void *bytes, size_t count) {
 }
 
 static void settle_loader(void) {
-    for (unsigned i = 0; loader_busy() && i < 1000; ++i)
+    for (unsigned i = 0; loader_busy() && i < 50000; ++i)
         loader_step();
     assert(!loader_busy());
 }
@@ -133,7 +135,7 @@ static void validate_headers(const uint8_t *file, uint32_t size) {
     write_le32(prefix + text + 4, 0xfffffff0);
     assert(elf_validate(prefix, size, &image) != NULL);
     memcpy(prefix, file, sizeof(prefix));
-    write_le32(prefix + text + 8, 0x20000000);
+    write_le32(prefix + text + 8, GUEST_END);
     assert(elf_validate(prefix, size, &image) != NULL);
     memcpy(prefix, file, sizeof(prefix));
     write_le32(prefix + text + 16, read_le32(prefix + text + 20) + 1);
@@ -156,16 +158,16 @@ static void load_and_reset(const uint8_t *file, uint32_t size) {
     loader_end();
     settle_loader();
     assert(loader.state == LOAD_DONE && !loader.error && program.state == READY);
-    assert(program.frame.x[2] == program.image.plan.stack_top &&
-           program.frame.pc == program.image.entry);
+    assert(program.threads[0].frame.x[2] == program.image.plan.stack_top &&
+           program.threads[0].frame.pc == program.image.entry);
     for (uint32_t i = 0; i < program.image.segment_count; ++i) {
         const Segment *s = &program.image.segments[i];
         assert(memcmp(physical(s->address), file + s->offset, s->file_size) == 0);
         for (uint32_t j = s->file_size; j < s->memory_size; ++j)
             assert(physical(s->address)[j] == 0);
     }
-    for (uint32_t i = 0; i < GUEST_BASE - 0x20000000; ++i)
-        assert(ram[i] == 0xa5);
+    for (uint32_t address = GUEST_END; address < 0x20082000; ++address)
+        assert(*physical(address) == 0xa5);
     assert(guest_range(DATA_BASE, DATA_SIZE, true));
     assert(!guest_range(TEXT_BASE, 1, true));
     assert(!guest_range(program.image.plan.snapshot_base, 1, true));
@@ -184,7 +186,7 @@ static void load_and_reset(const uint8_t *file, uint32_t size) {
 
     /* BEGIN and cancellation preserve the guest; the first payload invalidates it. */
     program.state = STOPPED;
-    program.frame.x[5] = 0x87654321;
+    program.threads[0].frame.x[5] = 0x87654321;
     Program old = program;
     uint8_t prefix[4096];
     memcpy(prefix, file, sizeof(prefix));
@@ -211,23 +213,47 @@ static void load_and_reset(const uint8_t *file, uint32_t size) {
 
 static void wire_checks(void) {
     assert(crc32_update(0, (const uint8_t *)"123456789", 9) == UINT32_C(0xcbf43926));
+    uint8_t payload[WIRE_PAYLOAD];
     WireFrame frame = {.type = WIRE_DATA,
                        .session = 0x123456789abcdef0,
                        .sequence = 4,
                        .offset = 3072,
-                       .length = 1024},
+                       .length = 1024,
+                       .payload = payload},
               decoded;
     for (unsigned i = 0; i < 1024; ++i)
-        frame.payload[i] = (uint8_t)i;
-    uint8_t encoded[WIRE_LIMIT];
-    size_t size = wire_encode(&frame, encoded);
+        payload[i] = (uint8_t)i;
+    uint8_t encoded[WIRE_LIMIT], received[WIRE_LIMIT];
+    size_t size = wire_encode(&frame, encoded, sizeof(encoded));
     assert(size < WIRE_LIMIT && encoded[0] == 0 && encoded[size - 1] == 0);
-    assert(wire_decode(encoded + 1, size - 2, &decoded));
+    memcpy(received, encoded, size);
+    assert(wire_decode(received + 1, size - 2, &decoded));
     assert(decoded.session == frame.session && decoded.offset == 3072 && decoded.length == 1024);
     assert(memcmp(decoded.payload, frame.payload, 1024) == 0);
     encoded[size / 2] ^= 1;
     assert(!wire_decode(encoded + 1, size - 2, &decoded));
-    assert(!wire_decode((const uint8_t *)"\xff", 1, &decoded));
+    uint8_t truncated[] = {0xff};
+    assert(!wire_decode(truncated, sizeof(truncated), &decoded));
+
+    /* Zero runs and 254-byte COBS boundaries must survive destructive decode.
+     * The capacity guard rejects an undersized destination before writing it. */
+    for (unsigned pattern = 0; pattern < 3; ++pattern) {
+        for (unsigned i = 0; i < sizeof(payload); ++i)
+            payload[i] = pattern == 0 ? 0 : pattern == 1 ? 255 : (uint8_t)i;
+        for (unsigned count = 0; count <= WIRE_PAYLOAD; ++count) {
+            frame.length = (uint16_t)count;
+            size_t required = 24 + count + (24 + count) / 254 + 3;
+            memset(encoded, 0x5a, sizeof(encoded));
+            assert(wire_encode(&frame, encoded, required - 1) == 0);
+            for (unsigned i = 0; i < sizeof(encoded); ++i)
+                assert(encoded[i] == 0x5a);
+            size = wire_encode(&frame, encoded, required);
+            assert(size && size <= required);
+            assert(wire_decode(encoded + 1, size - 2, &decoded));
+            assert(decoded.payload == encoded + 21 && decoded.length == count);
+            assert(!memcmp(decoded.payload, payload, count));
+        }
+    }
 }
 
 /* A tiny RWX image exercises header bytes as load data and permits ordinary
@@ -265,44 +291,45 @@ static void flexible_checks(void) {
 
     const char *args[] = {"one", "two words", ""};
     assert(!program_launch(3, args));
-    uint32_t sp = program.frame.x[2];
+    uint32_t sp = program.threads[0].frame.x[2];
     assert(!(sp & 15) && read_le32(physical(sp)) == 4);
     assert(!strcmp((char *)physical(read_le32(physical(sp + 12))), "two words"));
     assert(read_le32(physical(sp + 24)) == 0);
-    assert(program.frame.x[12] == sp + 24);
+    assert(program.threads[0].frame.x[12] == sp + 24);
     uint32_t base = program.current_break;
-    program.frame.cause = 8;
-    program.frame.x[17] = 214;
-    program.frame.x[10] = base + 1500;
+    program.threads[0].frame.cause = 8;
+    program.threads[0].frame.x[17] = 214;
+    program.threads[0].frame.x[10] = base + 1500;
     memset(physical(base), 0xaa, 1500);
-    program_after_trap();
+    program_after_trap(0);
+    program_step();
     assert(program.state == WAITING);
     assert(!guest_range(base, 1, true));
-    simulate_guest = true;
     program_step();
     assert(program.state == WAITING);
     program_step();
-    simulate_guest = false;
     assert(program.current_break == base + 1500 && guest_range(base, 1500, true));
     for (unsigned i = 0; i < 1500; ++i)
         assert(!*physical(base + i));
-    program.frame.cause = 8;
-    program.frame.x[17] = 214;
-    program.frame.x[10] = UINT32_MAX;
-    program_after_trap();
-    assert(program.frame.x[10] == base + 1500);
+    program.threads[0].frame.cause = 8;
+    program.threads[0].frame.x[17] = 214;
+    program.threads[0].frame.x[10] = UINT32_MAX;
+    program_after_trap(0);
+    program_step();
+    assert(program.threads[0].frame.x[10] == base + 1500);
 
     /* A large write waits across queue pressure and resumes without duplicating bytes. */
     for (unsigned i = 0; i < 700; ++i)
         physical(base)[i] = (uint8_t)i;
     guest_output_count = 0;
     guest_output_credit = 300;
-    program.frame.cause = 8;
-    program.frame.x[17] = 64;
-    program.frame.x[10] = 1;
-    program.frame.x[11] = base;
-    program.frame.x[12] = 700;
-    program_after_trap();
+    program.threads[0].frame.cause = 8;
+    program.threads[0].frame.x[17] = 64;
+    program.threads[0].frame.x[10] = 1;
+    program.threads[0].frame.x[11] = base;
+    program.threads[0].frame.x[12] = 700;
+    program_after_trap(0);
+    program_step();
     assert(program.state == WAITING && guest_output_count == 256);
     program_step();
     assert(program.state == WAITING && guest_output_count == 300);
@@ -312,11 +339,9 @@ static void flexible_checks(void) {
     program_step();
     assert(program.state == WAITING && guest_output_count == 300);
     guest_output_credit = 400;
-    simulate_guest = true;
     program_step();
     program_step();
-    simulate_guest = false;
-    assert(program.frame.x[10] == 700 && guest_output_count == 700);
+    assert(program.threads[0].frame.x[10] == 700 && guest_output_count == 700);
     assert(!memcmp(guest_output, physical(base), 700));
     guest_output_credit = SIZE_MAX;
 
@@ -363,6 +388,7 @@ static void flexible_checks(void) {
             count = 997;
         loader_feed(cursor, shared + cursor, count);
         cursor += count;
+        settle_loader();
     }
     loader_end();
     settle_loader();
@@ -446,7 +472,7 @@ static void solver_oracle(void) {
 
 static WireFrame request(const WireFrame *frame) {
     if (frame) {
-        in_count = wire_encode(frame, incoming);
+        in_count = wire_encode(frame, incoming, sizeof(incoming));
         in_cursor = 0;
     }
     for (unsigned i = 0; i < 1500; ++i) {
@@ -471,11 +497,12 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     WireFrame response = request(NULL);
     assert(response.type == WIRE_READY);
     uint64_t session = response.session;
-    WireFrame frame = {.type = WIRE_BEGIN, .session = session, .length = 10};
-    write_le32(frame.payload, size);
-    write_le32(frame.payload + 4, crc32_update(0, file, size));
-    frame.payload[8] = 1;
-    frame.payload[9] = 'x';
+    uint8_t payload[WIRE_PAYLOAD];
+    WireFrame frame = {.type = WIRE_BEGIN, .session = session, .length = 10, .payload = payload};
+    write_le32(payload, size);
+    write_le32(payload + 4, crc32_update(0, file, size));
+    payload[8] = 1;
+    payload[9] = 'x';
     response = request(&frame);
     assert(response.type == WIRE_ACK && response.sequence == 1);
     assert(!memcmp(&previous, &program, sizeof(program)));
@@ -493,8 +520,8 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
                             .session = session,
                             .sequence = sequence,
                             .offset = offset,
-                            .length = (uint16_t)count};
-        memcpy(frame.payload, file + offset, count);
+                            .length = (uint16_t)count,
+                            .payload = file + offset};
         response = request(&frame);
         assert(response.type == WIRE_ACK && response.offset == offset + count);
         assert(!program.valid && program.state == EMPTY);
@@ -517,6 +544,105 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     assert(response.type == WIRE_RESULT && response.payload[0] == 1 && response.payload[1] == 1);
 }
 
+static int32_t invoke(unsigned core, uint32_t number, uint32_t a0, uint32_t a1, uint32_t a2) {
+    GuestFrame *f = &program.threads[core].frame;
+    f->cause = 8;
+    f->x[17] = number;
+    f->x[10] = a0;
+    f->x[11] = a1;
+    f->x[12] = a2;
+    program_after_trap(core);
+    program_step();
+    return (int32_t)f->x[10];
+}
+
+/* Exercise lifecycle transitions and shared requests without assuming which
+ * hardware core next acquires the monitor gate. */
+static void thread_checks(void) {
+    program_forget();
+    Image image = {.entry = GUEST_BASE, .segment_count = 1};
+    image.segments[0] = (Segment){
+        .address = GUEST_BASE, .memory_size = 32, .file_size = 32, .permissions = PERM_R | PERM_X};
+    assert(!memory_plan_build(&image, SNAP_OFF));
+    program_install(&image);
+    assert(!program_launch(0, NULL));
+    assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0x76543210, 0) == 1);
+    GuestThread *second = &program.threads[1];
+    assert(second->state == THREAD_RUNNABLE && second->frame.pc == GUEST_BASE);
+    for (unsigned i = 0; i < 32; ++i)
+        assert(second->frame.x[i] == (i == 10 ? 0x76543210u : 0));
+    assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0, 0) == -11);
+    invoke(0, SYS_EXIT, 0, 0, 0);
+    assert(program.threads[0].state == THREAD_UNUSED && program.state == RUNNING);
+    assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE + 1, 0, 0) == -14);
+    assert(invoke(1, SYS_THREAD_CREATE, GUEST_END, 0, 0) == -14);
+    assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE, 123, 0) == 0);
+
+    /* Two heap expansions complete in request order with one published break. */
+    uint32_t base = program.current_break;
+    memset(physical(base), 0xcc, 3072);
+    invoke(0, SYS_BRK, base + 2048, 0, 0);
+    invoke(1, SYS_BRK, base + 3072, 0, 0);
+    while (program.threads[0].state == THREAD_BLOCKED || second->state == THREAD_BLOCKED)
+        program_step();
+    assert(program.current_break == base + 3072);
+    for (unsigned i = 0; i < 3072; ++i)
+        assert(!physical(base)[i]);
+
+    /* Read order follows requests rather than slot numbers or service order. */
+    invoke(1, SYS_READ, 0, base + 1, 1);
+    invoke(0, SYS_READ, 0, base, 1);
+    memcpy(read_bytes, "xy", 2);
+    read_count = 2;
+    read_cursor = 0;
+    program_step();
+    program_step();
+    assert(*physical(base + 1) == 'x' && *physical(base) == 'y');
+    read_count = read_cursor = 0;
+
+    /* A blocked write freezes during suspension and revalidates its buffer
+     * after another thread shrinks the heap. */
+    guest_output_credit = 0;
+    invoke(0, SYS_WRITE, 1, base, 128);
+    second->executing = true;
+    program_suspend("test");
+    assert(program.state == STOPPING);
+    program_step();
+    assert(program.threads[0].pending.count == 128);
+    second->frame.cause = UINT32_C(0x80000007);
+    program_after_trap(1);
+    assert(program.state == STOPPED && program_quiescent());
+    program_resume();
+    invoke(1, SYS_BRK, base, 0, 0);
+    program_step();
+    program_step();
+    assert((int32_t)program.threads[0].frame.x[10] == -14);
+    guest_output_credit = SIZE_MAX;
+
+    /* Group exit waits for the other core, while a fault preserves both
+     * frames and prohibits resuming either thread. */
+    program.threads[0].executing = true;
+    invoke(1, SYS_EXIT_GROUP, 7, 0, 0);
+    assert(program.state == STOPPING);
+    program.threads[0].frame.cause = UINT32_C(0x80000007);
+    program_after_trap(0);
+    assert(program.state == EXITED && program.exit_status == 7);
+    program_forget();
+    program_install(&image);
+    assert(!program_launch(0, NULL));
+    assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0, 0) == 1);
+    program.threads[0].executing = true;
+    second->frame.cause = 2;
+    second->frame.pc = GUEST_BASE + 2;
+    program_after_trap(1);
+    assert(program.state == STOPPING);
+    program.threads[0].frame.cause = UINT32_C(0x80000007);
+    program_after_trap(0);
+    assert(program.state == FAULTED && second->frame.pc == GUEST_BASE + 2);
+    program_resume();
+    assert(program.state == FAULTED);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     FILE *stream = fopen(argv[1], "rb");
@@ -533,6 +659,7 @@ int main(int argc, char **argv) {
     flexible_checks();
     solver_oracle();
     transfer_checks(file, (uint32_t)length);
+    thread_checks();
     free(file);
     puts("native checks: ELF rejection, streaming, reset, framing, retries, cancellation passed");
     return 0;

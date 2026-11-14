@@ -1,11 +1,17 @@
 """Shared executable-contract scenarios for emulator and protected hardware."""
 
+import time
 from typing import Protocol
+
+from pico_send import SerialPort
 
 
 class Session(Protocol):
+    console: SerialPort
+
     def load(self, name: str, *, reset: bool = True) -> None: ...
     def command(self, text: str) -> bytes: ...
+    def until(self, marker: bytes, timeout: float = 8) -> bytes: ...
 
 
 def check_exec(session: Session) -> None:
@@ -13,6 +19,7 @@ def check_exec(session: Session) -> None:
     output = session.command("run")
     assert b"RWX sandbox OK" in output and b"fault" not in output and b"exit:" not in output, output
     session.load("assembly.elf")
+    assert b"20000000" in session.command("map")
     assert b"hello from assembly" in session.command("run")
     session.load("exec.elf")
     output = session.command('run one "two words" ""')
@@ -32,3 +39,38 @@ def check_exec(session: Session) -> None:
     assert b"exec data=7 bss=0" in session.command("run")
     session.command("reset")
     assert b"exec data=7 bss=0" in session.command("run")
+
+
+def check_threads(session: Session) -> None:
+    session.load("threads.elf")
+    for attempt in range(2):
+        if attempt:
+            session.command("reset")
+        output = session.command("run")
+        assert b"thread replacement OK" in output and b"exit:" not in output, output
+        info = session.command("info")
+        assert b"state: exited" in info, info
+        assert b"thread 0: unused" in info and b"thread 1: unused" in info, info
+
+    session.load("threads_busy.elf")
+    session.console.write(b"run\r")
+    session.until(b"two threads running\r\n")
+    for _ in range(2):
+        time.sleep(0.02)
+        session.console.write(b"\x1b")
+        session.until(b"pico> ")
+        info = session.command("info")
+        assert b"state: stopped" in info, info
+        assert b"thread 0: runnable" in info and b"thread 1: runnable" in info, info
+        session.console.write(b"resume\r")
+    time.sleep(0.02)
+    session.console.write(b"\x1b")
+    session.until(b"pico> ")
+    session.command("reset")
+    assert b"state: ready" in session.command("info")
+
+    session.load("threads_fault.elf")
+    output = session.command("run")
+    assert b"guest fault: cause=3 " in output and b"thread=1" in output, output
+    assert b"state: faulted" in session.command("info")
+    assert b"resume requires" in session.command("resume")

@@ -178,8 +178,15 @@ int main(int argc, char **argv) {
     }
     signal(SIGINT, stop);
     signal(SIGTERM, stop);
-    RP2350Options options = {.coreArch = "riscv", .loadFirmware = argv[1]};
+    RP2350Options options = {.coreArch = "riscv"};
     chip = RP2350_new(&options);
+    LoadFirmwareResult *firmware = RP2350_loadFirmware(chip, argv[1], NULL);
+    if (firmware->useSram) {
+        free(firmware);
+        fprintf(stderr, "emulator requires flash firmware\n");
+        return 2;
+    }
+    free(firmware);
     chip->usbCtrl->onUSBEnabled_fn = enabled;
     chip->usbCtrl->onResetReceived_fn = reset_received;
     chip->usbCtrl->onEndpointRead_fn = endpoint_read;

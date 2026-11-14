@@ -32,7 +32,8 @@ void shell_init(void) {
 #ifdef MONITOR_EMULATOR
     console_printf("EMULATOR BUILD: guests run in M-mode WITHOUT isolation\r\n");
 #else
-    console_printf("hart 0: M-mode monitor, U-mode guests; Ctrl-C/Escape suspends\r\n");
+    console_printf(
+        "two harts: serialized M-mode monitor, U-mode threads; Ctrl-C/Escape suspends\r\n");
 #endif
     shell_prompt();
 }
@@ -53,14 +54,20 @@ static void info(void) {
                            (unsigned long)s->address, (unsigned long)s->memory_size,
                            (unsigned long)s->file_size, (unsigned long)s->offset);
         }
-        console_printf("stack: %08lx..%08lx RW; pc=%08lx sp=%08lx cpu-us=%llu\r\n",
-                       (unsigned long)program.image.plan.stack_base,
-                       (unsigned long)program.image.plan.stack_top, (unsigned long)program.frame.pc,
-                       (unsigned long)program.frame.x[2], (unsigned long long)program.cpu_us);
+        console_printf("stack: %08lx..%08lx RW\r\n", (unsigned long)program.image.plan.stack_base,
+                       (unsigned long)program.image.plan.stack_top);
+        for (unsigned i = 0; i < 2; ++i) {
+            const GuestThread *thread = &program.threads[i];
+            static const char *const names[] = {"unused", "runnable", "blocked"};
+            console_printf("thread %u: %s pc=%08lx sp=%08lx cpu-us=%llu\r\n", i,
+                           names[thread->state], (unsigned long)thread->frame.pc,
+                           (unsigned long)thread->frame.x[2], (unsigned long long)thread->cpu_us);
+        }
         if (program.state == EXITED)
             console_printf("exit status: %ld\r\n", (long)program.exit_status);
         if (program.state == FAULTED)
-            console_printf("trap cause: %lu\r\n", (unsigned long)program.frame.cause);
+            console_printf("trap cause: %lu\r\n",
+                           (unsigned long)program.threads[program.fault_thread].frame.cause);
         if (program.state == STOPPED)
             console_printf("stop reason: %s\r\n", program.stop_reason);
     }
@@ -192,8 +199,7 @@ static void execute(void) {
         if (program.state != STOPPED)
             console_printf("resume requires a suspended program\r\n");
         else {
-            program.state = program.stopped_state;
-            guest_input_clear();
+            program_resume();
             return;
         }
     } else if (strcmp(line, "quit") == 0) {
@@ -217,7 +223,7 @@ void shell_input(uint8_t byte) {
             transfer_cancel("cancelled from console");
         return;
     }
-    if (program.reset_busy || prompt_pending)
+    if (program.reset_busy || prompt_pending || program.state == STOPPING)
         return;
     if (byte == '\n' && swallow_lf) {
         swallow_lf = false;
@@ -259,7 +265,7 @@ void shell_step(void) {
     memory_map_step();
     if (prompt_pending && console_connected() && console_empty() && !program.reset_busy &&
         !memory_map_busy() && program.state != RUNNING && program.state != WAITING &&
-        !transfer_active()) {
+        !transfer_active() && program.state != STOPPING && program_quiescent()) {
         console_printf("pico> ");
         prompt_pending = false;
     }

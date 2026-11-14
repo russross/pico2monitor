@@ -6,12 +6,9 @@
 #include <stdint.h>
 
 /* Physical linkage stays stable while runtime allocations follow the image. */
-#if defined(PICO_NO_FLASH) && PICO_NO_FLASH
-#define GUEST_BASE UINT32_C(0x20020000)
-#else
-#define GUEST_BASE UINT32_C(0x20018000)
-#endif
-#define GUEST_END UINT32_C(0x20080000)
+#define GUEST_BASE UINT32_C(0x20000000)
+#define MAIN_SRAM_END UINT32_C(0x20080000)
+#define GUEST_END UINT32_C(0x2007c000)
 #define PMP_ENTRIES 7u
 #define MAX_SEGMENTS 16u
 #define HEAP_RESERVE UINT32_C(0x8000)

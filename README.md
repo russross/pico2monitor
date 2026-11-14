@@ -1,7 +1,7 @@
 Pico 2 SRAM monitor
 ===================
 
-Run student RISC-V assembly programs on a Pico 2 with a short build/upload/run cycle. The monitor runs in machine mode and executes one statically linked guest in user mode. The sandbox always protects the monitor and system resources; protections against mistakes inside guest memory are best effort.
+Run student RISC-V assembly programs on a Pico 2 with a short build/upload/run cycle. The monitor runs in machine mode and executes one statically linked guest with up to two user-mode threads. The sandbox always protects the monitor and system resources; protections against mistakes inside guest memory are best effort.
 
 Programs use a small Linux-style userspace contract: physical-address static ELF32 linkage, argc/argv/envp on the initial stack, console descriptors, Linux syscall numbers, and a brk heap. A special guest linker script is not required. See [Preparing and running executables](EXECUTABLES.md) for the complete contract and build commands.
 
@@ -17,13 +17,15 @@ Build and use
 
 Both channels use the same USB cable. Utilities prefer stable serial identities; `--port DEVICE` selects a particular board. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.
 
-`build/exec.elf` demonstrates quoted arguments, empty envp, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20020000`. Older hello/echo/loop/register examples and protection probes retain the fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
+`build/exec.elf` demonstrates quoted arguments, empty envp, brk allocation, and reset state. Both it and `build/assembly.elf` use the toolchain's default linker script with `-Ttext-segment=0x20000000`. `build/threads.elf` demonstrates explicit stack setup and reusable thread slots. Older hello/echo/loop/register examples and protection probes retain the higher-address fixed-layout linker fixture for regression coverage; that layout is not a monitor requirement.
 
 
 Memory and shell
 ----------------
 
-Flash firmware reserves 96 KiB of low SRAM for monitor storage and an 8 KiB normal stack. SRAM-executing firmware reserves 128 KiB. Guest load segments, heap, stack, and optional protected reset data share the remainder of main SRAM through 0x20080000. Final scratch banks remain trusted. Linker assertions, measured stack high-water output, and compiler stack-usage reports support the budget.
+Guest images can link at the stable SRAM base, 0x20000000. The monitor executes from flash and reserves the top 16 KiB of main SRAM for static storage. The 496 KiB below that boundary holds guest segments, heap, initial stack, and protected reset data. Scratch SRAM holds a 4 KiB console output ring and one shared 4 KiB monitor stack. Monitor faults stop the peer before reusing guest RAM as a recovery stack. Linker assertions, measured stack high-water output, and compiler stack-usage reports support the budget.
+
+Either core can enter the monitor through a stack-free atomic gate. Monitor calls advance bounded state-machine work and release the lock before resuming a guest or waiting for an interrupt. Custom syscall 1000 starts a second thread at a supplied PC with a parameter in a0 and all other registers zero. Guests own additional stack and TLS arrangements; no special load mode is needed. Ctrl-C/Escape suspends both threads before presenting the prompt.
 
 The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `info`, `map`, `help [COMMAND]`, `quit`, and `bootsel`.
 

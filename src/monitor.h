@@ -21,26 +21,38 @@ typedef struct {
     uint32_t x[32];
     uint32_t pc, cause, status;
 } GuestFrame;
-typedef enum { EMPTY, READY, RUNNING, WAITING, STOPPED, EXITED, FAULTED } ProgramState;
+typedef enum { EMPTY, READY, RUNNING, WAITING, STOPPED, EXITED, FAULTED, STOPPING } ProgramState;
+typedef enum { THREAD_UNUSED, THREAD_RUNNABLE, THREAD_BLOCKED } ThreadState;
 typedef enum { CALL_NONE, CALL_READ, CALL_WRITE, CALL_SLEEP, CALL_BRK } PendingKind;
 typedef struct {
     PendingKind kind;
     uint32_t address, count;
     uint64_t deadline;
     uint32_t written;
+    uint64_t order;
 } PendingCall;
+/* Only the owning core saves registers outside the monitor lock. Other cores
+ * may inspect this frame only after executing has been cleared under the lock. */
+typedef struct {
+    GuestFrame frame;
+    PendingCall pending;
+    ThreadState state;
+    bool executing, trap_pending;
+    uint64_t entered_at, cpu_us;
+} GuestThread;
 typedef struct {
     Image image;
     ProgramState state;
     ProgramState stopped_state;
-    GuestFrame frame;
-    PendingCall pending;
+    GuestThread threads[2];
     bool valid, reset_busy;
     uint32_t reset_cursor;
     uint32_t current_break;
     int32_t exit_status;
     const char *stop_reason;
-    uint64_t cpu_us;
+    uint64_t next_order;
+    ProgramState stop_target;
+    unsigned fault_thread;
 } Program;
 extern Program program;
 
@@ -52,19 +64,26 @@ void monitor_bootsel(void);
 void monitor_service_irqs(void);
 void monitor_memory_report(void);
 void monitor_trap_init(void);
-void guest_enter(GuestFrame *frame);
+void monitor_start_locked(void) __attribute__((noreturn));
+void monitor_core_entry(void);
+GuestFrame *monitor_dispatch(unsigned core, bool guest_trap);
 void pmp_disable(void);
 void pmp_enable(const MemoryPlan *plan);
 void pmp_init(void);
+void pmp_core_init(void);
 
 void program_forget(void);
 void program_install(const Image *image);
 void program_reset(void);
 void program_step(void);
 void program_suspend(const char *reason);
-void program_after_trap(void);
+void program_after_trap(unsigned core);
+void program_resume(void);
+bool program_quiescent(void);
 bool guest_range(uint32_t address, uint32_t size, bool writable);
 const char *memory_plan_build(Image *image, SnapshotPolicy policy);
+void memory_plan_start(Image *image, SnapshotPolicy policy);
+bool memory_plan_step(const char **error);
 bool memory_plan_verify(const Image *image);
 uint8_t memory_permissions(const MemoryPlan *plan, uint32_t address);
 uint32_t memory_snapshot_offset(const Image *image, uint32_t index);

@@ -1,0 +1,2 @@
+/* Compiler arithmetic helpers execute from flash alongside ordinary code. */
+*(.text*)

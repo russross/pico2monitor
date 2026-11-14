@@ -3,15 +3,15 @@ CMAKE := $(CURDIR)/deps/cmake/bin/cmake
 GUEST_CC := $(CURDIR)/deps/toolchain/bin/riscv32-pico-elf-gcc
 PICOTOOL ?= $(CURDIR)/deps/picotool/picotool
 GUEST_FLAGS := -march=rv32imac_zicsr_zifencei -mabi=ilp32 -Os -g -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -Wall -Wextra -Werror -nostdlib -Isrc -Itests -Wl,-m,elf32lriscv,-z,max-page-size=4096,-T,tests/guest.ld
-DEFAULT_GUEST_FLAGS := -march=rv32imac_zicsr_zifencei -mabi=ilp32 -Os -g -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -Wall -Wextra -Werror -nostdlib -static -no-pie -Isrc -Itests -Wl,-Ttext-segment=0x20020000,-e,_start
-GUEST_COMMON := tests/guest_start.S tests/guest.c tests/guest.h src/syscall.h tests/guest.ld
-GUESTS := $(addprefix build/,$(addsuffix .elf,hello echo loop exit23 registers exec assembly rwx))
+DEFAULT_GUEST_FLAGS := -march=rv32imac_zicsr_zifencei -mabi=ilp32 -Os -g -ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -Wall -Wextra -Werror -nostdlib -static -no-pie -Isrc -Itests -Wl,-Ttext-segment=0x20000000,-e,_start
+GUEST_COMMON := tests/guest_start.S tests/guest.c tests/guest.h src/syscall.h src/memory.h tests/guest.ld Makefile
+GUESTS := $(addprefix build/,$(addsuffix .elf,hello echo loop exit23 registers exec assembly rwx threads threads_busy threads_fault))
 PROBES := $(addprefix build/probe,$(addsuffix .elf,1 2 3 4 5 6 7 8 9 10 11 12))
 NATIVE_SOURCES := memory launch map elf wire loader program transfer
 C_FILES := $(wildcard src/*.c src/*.h tests/*.c tests/*.h)
 PY_FILES := $(wildcard src/*.py scripts/*.py tests/*.py) src/pico-send src/pico-console
 
-.PHONY: all deps firmware guests emulator check native-check emulator-check format format-check flash install-udev clean
+.PHONY: all deps firmware guests emulator check native-check emulator-check panic-check format format-check flash install-udev clean
 all: dist/monitor.uf2 dist/pico-send dist/pico-console guests build/emulator
 deps:
 	./scripts/setup-deps.py
@@ -38,18 +38,24 @@ build/hello.elf build/echo.elf build/loop.elf build/exit23.elf: tests/guest_demo
 	$(GUEST_CC) $(GUEST_FLAGS) -DDEMO=$(if $(findstring hello,$@),1,$(if $(findstring echo,$@),2,$(if $(findstring loop,$@),3,4))) tests/guest_start.S tests/guest.c $< -o $@
 build/probe%.elf: tests/guest_probe.c $(GUEST_COMMON) | build deps
 	$(GUEST_CC) $(GUEST_FLAGS) -DPROBE=$* tests/guest_start.S tests/guest.c $< -o $@
-build/registers.elf: tests/guest_registers.S tests/guest.ld | build deps
+build/registers.elf: tests/guest_registers.S tests/guest.ld Makefile | build deps
 	$(GUEST_CC) $(GUEST_FLAGS) $< -o $@
 build/exec.elf: tests/guest_exec.c $(GUEST_COMMON) | build deps
 	$(GUEST_CC) $(DEFAULT_GUEST_FLAGS) tests/guest_start.S tests/guest.c $< -o $@
-build/assembly.elf: tests/hello.S | build deps
+build/assembly.elf: tests/hello.S Makefile | build deps
 	$(GUEST_CC) $(DEFAULT_GUEST_FLAGS) $< -o $@
-build/rwx.elf: tests/guest_rwx.S | build deps
+build/rwx.elf: tests/guest_rwx.S Makefile | build deps
 	$(GUEST_CC) $(DEFAULT_GUEST_FLAGS) -Wl,-N $< -o $@
+build/threads.elf build/threads_busy.elf build/threads_fault.elf: tests/guest_threads.S src/syscall.h Makefile | build deps
+	$(GUEST_CC) $(DEFAULT_GUEST_FLAGS) -DTHREAD_TEST=$(if $(findstring busy,$@),1,$(if $(findstring fault,$@),2,0)) $< -o $@
 deps/rp2350js-c.h: | deps
 	@test -f $@
 build/emulator: tests/emulator.c deps/rp2350js-c.h | build
 	$(CC) -O2 -std=gnu11 -Ideps $< -o $@ -lm
+build/test-panic: tests/test_panic.c deps/rp2350js-c.h | build
+	$(CC) -O2 -std=gnu11 -Ideps $< -o $@ -lm
+panic-check: build/test-panic build/monitor_emu.hex
+	PYTHONPATH=src:tests python3 -m unittest -v test_panic
 emulator: build/emulator build/monitor_emu.hex
 	./build/emulator build/monitor_emu.hex
 
@@ -76,6 +82,7 @@ check: format-check
 	$(MAKE) native-check
 	PYTHONPATH=src:tests python3 -m unittest -v test_host
 	$(MAKE) emulator-check
+	$(MAKE) panic-check
 flash: dist/monitor.uf2
 	sudo $(PICOTOOL) load -v $<
 	sudo $(PICOTOOL) reboot

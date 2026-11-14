@@ -6,7 +6,7 @@
 Loader loader;
 
 bool loader_busy(void) {
-    return loader.state == LOAD_CLEAR || loader.state == LOAD_SNAPSHOT;
+    return loader.state == LOAD_PLAN || loader.state == LOAD_CLEAR || loader.state == LOAD_SNAPSHOT;
 }
 
 void loader_begin(uint32_t size, uint32_t crc, const char *name) {
@@ -66,21 +66,17 @@ void loader_feed(uint32_t offset, const uint8_t *bytes, uint32_t count) {
         memcpy(loader.prefix + offset, loader.upload, prefix);
         if (offset + prefix < target)
             return;
-        loader.error = elf_validate(loader.prefix, loader.image.file_size, &loader.image);
+        loader.error = elf_decode(loader.prefix, loader.image.file_size, &loader.image);
         if (loader.error) {
             loader.state = LOAD_DISCARD;
             return;
         }
 
-        /* Move both live buffers as one overlap-safe block. The planner's
-         * workspace is dead, and every segment ends below the selected stack. */
-        uint8_t *buffers = physical(loader.image.plan.stack_base);
-        memmove(buffers, loader.prefix, ELF_PREFIX_SIZE + 1024);
-        loader.prefix = buffers;
-        loader.upload = buffers + ELF_PREFIX_SIZE;
-        loader.state = LOAD_STREAM;
-        copy_intersections(0, loader.prefix, target);
-        copy_intersections(target, loader.upload + prefix, count - prefix);
+        loader.replay_target = target;
+        loader.replay_prefix = prefix;
+        loader.replay_count = count;
+        memory_plan_start(&loader.image, loader.image.plan.requested);
+        loader.state = LOAD_PLAN;
     } else if (loader.state == LOAD_STREAM)
         copy_intersections(offset, loader.upload, count);
 }
@@ -110,7 +106,24 @@ static void finish(void) {
 }
 
 void loader_step(void) {
-    if (loader.state == LOAD_CLEAR) {
+    if (loader.state == LOAD_PLAN) {
+        if (!memory_plan_step(&loader.error))
+            return;
+        if (loader.error) {
+            loader.state = LOAD_DISCARD;
+            return;
+        }
+        /* Live input moves above every segment destination only after the
+         * planner has finished using disposable arena memory. */
+        uint8_t *buffers = physical(loader.image.plan.stack_base);
+        memmove(buffers, loader.prefix, ELF_PREFIX_SIZE + 1024);
+        loader.prefix = buffers;
+        loader.upload = buffers + ELF_PREFIX_SIZE;
+        loader.state = LOAD_STREAM;
+        copy_intersections(0, loader.prefix, loader.replay_target);
+        copy_intersections(loader.replay_target, loader.upload + loader.replay_prefix,
+                           loader.replay_count - loader.replay_prefix);
+    } else if (loader.state == LOAD_CLEAR) {
         clear_chunk();
         if (loader.work_cursor == GUEST_END) {
             loader.prefix = loader.upload = NULL;

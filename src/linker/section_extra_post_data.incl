@@ -1,0 +1,8 @@
+/* Ring indices begin empty, so payload storage needs no startup initialization. */
+SECTIONS
+{
+    .console_output (NOLOAD):
+    {
+        *(.monitor_output)
+    } > SCRATCH_X
+}

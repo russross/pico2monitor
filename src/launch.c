@@ -65,10 +65,12 @@ const char *program_launch(unsigned argc, const char *const *argv) {
         aux[10] = aux[11] = 0;
     }
     memcpy(physical(cursor), aux, aux_words * 4);
-    program.frame.x[2] = sp;
-    program.frame.x[10] = argc + 1;
-    program.frame.x[11] = argv_address;
-    program.frame.x[12] = envp_address;
+    GuestThread *thread = &program.threads[0];
+    thread->frame.x[2] = sp;
+    thread->frame.x[10] = argc + 1;
+    thread->frame.x[11] = argv_address;
+    thread->frame.x[12] = envp_address;
+    thread->state = THREAD_RUNNABLE;
     program.state = RUNNING;
     guest_input_clear();
     return NULL;

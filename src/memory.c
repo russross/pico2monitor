@@ -14,8 +14,13 @@ typedef struct {
     uint8_t used, left;
     bool valid, install;
 } Choice;
+typedef enum { SCAN, LEAF, LEFT_CHILD, RIGHT_CHILD, COMBINE, SOLVED } SolveStage;
 typedef struct {
     Choice best[5][8], left[5][8];
+    uint32_t base, size, cursor, ordinal;
+    Cell first;
+    SolveStage stage;
+    bool uniform, legal;
 } Workspace;
 /* Planning runs only before segment initialization, using disposable guest SRAM. */
 #define workspace ((Workspace *)physical(GUEST_BASE + 8192))
@@ -23,6 +28,7 @@ _Static_assert(8192 + sizeof(Workspace) * 15 <= GUEST_END - GUEST_BASE,
                "planning workspace must fit guest SRAM");
 static const uint8_t modes[] = {0, 4, 5, 6, 7};
 static const Image *solving;
+static unsigned solve_depth, solve_floor;
 
 static bool intersects(uint32_t a, uint32_t n, uint32_t b, uint32_t m) {
     return n && m && a < b + m && b < a + n;
@@ -99,65 +105,104 @@ static bool better(Choice a, Choice b) {
 
 /* Uniform subtrees terminate immediately. Boundary subtrees combine child
  * budgets, with an optional parent permission override after child exceptions. */
-static uint8_t solve(uint32_t base, uint32_t size, unsigned depth) {
+static void solve_node(uint32_t base, uint32_t size, unsigned depth) {
     Workspace *w = &workspace[depth];
-    memset(w->best, 0, sizeof(w->best));
-    Cell first = cell(base);
-    bool legal = region_legal(base, size);
-    bool uniform = true;
-    uint8_t required = first.required;
-    for (uint32_t a = base + 32; a < base + size; a += 32) {
-        Cell c = cell(a);
-        required |= c.required;
-        uniform = uniform && c.required == first.required && c.roles == first.roles &&
-                  c.trusted == first.trusted;
-    }
-    if (uniform) {
-        for (unsigned m = 0; m < 5; ++m) {
-            for (unsigned b = 0; b < 8; ++b) {
-                for (unsigned q = 0; q < 5; ++q) {
-                    uint8_t permission = modes[q];
-                    bool install = permission != modes[m];
-                    if ((first.trusted && permission) || (permission & required) != required ||
-                        (install && (!b || !legal)))
-                        continue;
-                    Choice v = {.valid = true,
-                                .install = install,
-                                .used = install,
-                                .left = (uint8_t)q,
-                                .score = reward(first, permission, base, size)};
-                    if (better(v, w->best[m][b]))
-                        w->best[m][b] = v;
-                }
+    memset(w, 0, sizeof(*w));
+    w->base = base;
+    w->size = size;
+    w->cursor = base + 32;
+    w->first = cell(base);
+    w->uniform = true;
+    w->legal = region_legal(base, size);
+}
+
+static void solve_begin(uint32_t base, uint32_t size, unsigned depth) {
+    solve_depth = solve_floor = depth;
+    solve_node(base, size, depth);
+}
+
+/* A solver step evaluates a bounded number of cells or budget combinations.
+ * Its traversal stack lives in disposable guest memory, never on the C stack. */
+static bool solve_step(void) {
+    for (unsigned work = 0; work < 512; ++work) {
+        Workspace *w = &workspace[solve_depth];
+        if (w->stage == SCAN) {
+            if (w->uniform && w->cursor < w->base + w->size) {
+                Cell c = cell(w->cursor);
+                w->uniform = c.required == w->first.required && c.roles == w->first.roles &&
+                             c.trusted == w->first.trusted;
+                w->cursor += 32;
+            } else if (w->uniform)
+                w->stage = LEAF;
+            else {
+                w->stage = LEFT_CHILD;
+                ++solve_depth;
+                solve_node(w->base, w->size / 2, solve_depth);
             }
+            continue;
         }
-        return required;
-    }
-    solve(base, size / 2, depth + 1);
-    memcpy(w->left, workspace[depth + 1].best, sizeof(w->left));
-    solve(base + size / 2, size / 2, depth + 1);
-    for (unsigned m = 0; m < 5; ++m) {
-        for (unsigned b = 0; b < 8; ++b) {
-            for (unsigned q = 0; q < 5; ++q) {
-                bool install = q != m;
-                if (install && (!b || !legal))
-                    continue;
-                unsigned available = b - install;
-                for (unsigned left = 0; left <= available; ++left) {
-                    Choice l = w->left[q][left];
-                    Choice r = workspace[depth + 1].best[q][available - left];
-                    Choice v = {.valid = l.valid && r.valid,
-                                .score = l.score + r.score,
-                                .used = (uint8_t)(l.used + r.used + install),
-                                .left = (uint8_t)(left | (q << 4)),
-                                .install = install};
-                    if (better(v, w->best[m][b]))
-                        w->best[m][b] = v;
-                }
-            }
+        if (w->stage == SOLVED) {
+            if (solve_depth == solve_floor)
+                return true;
+            --solve_depth;
+            Workspace *parent = &workspace[solve_depth];
+            if (parent->stage == LEFT_CHILD) {
+                memcpy(parent->left, w->best, sizeof(parent->left));
+                parent->stage = RIGHT_CHILD;
+                ++solve_depth;
+                solve_node(parent->base + parent->size / 2, parent->size / 2, solve_depth);
+            } else
+                parent->stage = COMBINE;
+            continue;
         }
+
+        /* Flat ordinals preserve the deterministic m/b/q/left tie order while
+         * allowing a monitor invocation to stop between any two candidates. */
+        bool leaf = w->stage == LEAF;
+        unsigned ordinal = w->ordinal++;
+        unsigned left = leaf ? 0 : ordinal % 8;
+        if (!leaf)
+            ordinal /= 8;
+        unsigned q = ordinal % 5, b = ordinal / 5 % 8, m = ordinal / 40;
+        if (m == 5) {
+            w->stage = SOLVED;
+            continue;
+        }
+        uint8_t permission = modes[q];
+        bool install = q != m;
+        if (install && (!b || !w->legal))
+            continue;
+        Choice v = {.install = install};
+        if (leaf) {
+            if ((w->first.trusted && permission) ||
+                (permission & w->first.required) != w->first.required)
+                continue;
+            v.valid = true;
+            v.used = install;
+            v.left = (uint8_t)q;
+            v.score = reward(w->first, permission, w->base, w->size);
+        } else {
+            unsigned available = b - install;
+            if (left > available)
+                continue;
+            Choice l = w->left[q][left];
+            Choice r = workspace[solve_depth + 1].best[q][available - left];
+            v.valid = l.valid && r.valid;
+            v.score = l.score + r.score;
+            v.used = (uint8_t)(l.used + r.used + install);
+            v.left = (uint8_t)(left | (q << 4));
+        }
+        if (better(v, w->best[m][b]))
+            w->best[m][b] = v;
     }
-    return required;
+    return false;
+}
+
+#ifdef MONITOR_NATIVE_TEST
+static void solve(uint32_t base, uint32_t size, unsigned depth) {
+    solve_begin(base, size, depth);
+    while (!solve_step()) {
+    }
 }
 
 static void reconstruct(uint32_t base, uint32_t size, unsigned depth, unsigned inherited,
@@ -181,6 +226,7 @@ static void reconstruct(uint32_t base, uint32_t size, unsigned depth, unsigned i
     if (choice.install)
         plan->regions[plan->region_count++] = (PmpRegion){base, size, modes[permission]};
 }
+#endif
 
 uint8_t memory_permissions(const MemoryPlan *plan, uint32_t address) {
     for (uint32_t i = 0; i < plan->region_count; ++i) {
@@ -193,7 +239,7 @@ uint8_t memory_permissions(const MemoryPlan *plan, uint32_t address) {
 
 /* Verification decodes the selected first-match map independently of DP scores.
  * Every granule is checked, including trusted space around guest allocations. */
-bool memory_plan_verify(const Image *image) {
+static bool verify_range(const Image *image, uint32_t begin, uint32_t end) {
     const MemoryPlan *p = &image->plan;
     if (p->region_count > PMP_ENTRIES || p->heap_base < GUEST_BASE ||
         p->heap_base > p->heap_limit || p->heap_limit > p->stack_base ||
@@ -212,7 +258,20 @@ bool memory_plan_verify(const Image *image) {
     }
     bool previous_execute = false;
     uint32_t previous_entry = PMP_ENTRIES;
-    for (uint32_t a = 0x20000000; a < GUEST_END; a += 32) {
+    if (begin > GUEST_BASE) {
+        for (uint32_t i = 0; i < image->segment_count; ++i) {
+            const Segment *s = &image->segments[i];
+            previous_execute =
+                previous_execute || ((s->permissions & PERM_X) &&
+                                     intersects(begin - 32, 32, s->address, s->memory_size));
+        }
+        for (uint32_t i = 0; i < p->region_count; ++i)
+            if (range_contains(p->regions[i].base, p->regions[i].size, begin - 32, 1)) {
+                previous_entry = i;
+                break;
+            }
+    }
+    for (uint32_t a = begin; a < end; a += 32) {
         uint8_t actual = memory_permissions(p, a);
         bool execute = false;
         uint32_t entry = PMP_ENTRIES;
@@ -241,6 +300,10 @@ bool memory_plan_verify(const Image *image) {
             return false;
     }
     return true;
+}
+
+bool memory_plan_verify(const Image *image) {
+    return verify_range(image, GUEST_BASE, MAIN_SRAM_END);
 }
 
 uint32_t memory_snapshot_offset(const Image *image, uint32_t index) {
@@ -274,25 +337,124 @@ static const char *layout(Image *image, bool snapshot, uint32_t alignment) {
     uint32_t spare = p->stack_base - p->heap_base;
     p->heap_limit = p->stack_base - (spare >= 1024 ? 1024 : 0);
     p->region_count = 0;
+    return NULL;
+}
+
+typedef enum { PLAN_ENTER, PLAN_LEFT, PLAN_RIGHT, PLAN_EMIT } PlanStage;
+typedef struct {
+    uint32_t base, size;
+    unsigned inherited, budget, permission, left;
+    PlanStage stage;
+    bool install;
+} PlanNode;
+static struct {
+    Image *image;
+    PlanNode nodes[15];
+    unsigned depth, candidate;
+    uint32_t verify_cursor;
+    bool searching, verifying, done;
+    const char *error;
+} planning;
+
+static void plan_candidate(void) {
+    Image *image = planning.image;
+    planning.error =
+        layout(image, planning.candidate < 2, planning.candidate == 1 ? 32 : STACK_SIZE);
+    if (!planning.error && planning.candidate < 2 &&
+        image->plan.heap_limit - image->plan.heap_base < HEAP_RESERVE)
+        planning.error = "insufficient reset headroom";
+    planning.depth = 0;
+    planning.nodes[0] = (PlanNode){.base = GUEST_BASE, .size = 0x80000, .budget = PMP_ENTRIES};
+    planning.searching = false;
+    planning.verifying = false;
+}
+
+void memory_plan_start(Image *image, SnapshotPolicy policy) {
+    memset(&planning, 0, sizeof(planning));
+    image->plan.requested = policy;
+    planning.image = image;
     solving = image;
-    solve(0x20000000, 0x80000, 0);
-    if (!workspace[0].best[0][PMP_ENTRIES].valid)
-        return "cannot isolate this layout with available PMP entries";
-    reconstruct(0x20000000, 0x80000, 0, 0, PMP_ENTRIES, p);
-    return memory_plan_verify(image) ? NULL : "invalid effective memory plan";
+    planning.candidate = policy == SNAP_OFF ? 2 : 0;
+    plan_candidate();
+}
+
+/* Reconstruction repeats bounded subtree solves and emits child exceptions
+ * before their parent grants. Verification also advances in bounded slices. */
+bool memory_plan_step(const char **error) {
+    Image *image = planning.image;
+    if (planning.done) {
+        *error = planning.error;
+        return true;
+    }
+    *error = NULL;
+    if (planning.error) {
+        if (planning.candidate++ < 2) {
+            plan_candidate();
+            return false;
+        }
+        planning.done = true;
+    } else if (planning.verifying) {
+        uint32_t end = planning.verify_cursor + 4096;
+        if (!verify_range(image, planning.verify_cursor, end))
+            planning.error = "invalid effective memory plan";
+        else {
+            planning.verify_cursor = end;
+            planning.done = end == MAIN_SRAM_END;
+        }
+    } else {
+        PlanNode *node = &planning.nodes[planning.depth];
+        if (node->stage == PLAN_ENTER) {
+            if (!planning.searching) {
+                solve_begin(node->base, node->size, 0);
+                planning.searching = true;
+            }
+            if (!solve_step())
+                return false;
+            planning.searching = false;
+            Choice choice = workspace[0].best[node->inherited][node->budget];
+            if (!choice.valid) {
+                planning.error = "cannot isolate this layout with available PMP entries";
+                return false;
+            }
+            node->permission = workspace[0].uniform ? choice.left : choice.left >> 4;
+            node->left = choice.left & 15;
+            node->install = choice.install;
+            node->stage = workspace[0].uniform ? PLAN_EMIT : PLAN_LEFT;
+        } else if (node->stage == PLAN_LEFT || node->stage == PLAN_RIGHT) {
+            bool right = node->stage == PLAN_RIGHT;
+            node->stage = right ? PLAN_EMIT : PLAN_RIGHT;
+            PlanNode child = {.base = node->base + (right ? node->size / 2 : 0),
+                              .size = node->size / 2,
+                              .inherited = node->permission,
+                              .budget =
+                                  right ? node->budget - node->install - node->left : node->left};
+            planning.nodes[++planning.depth] = child;
+        } else {
+            if (node->install) {
+                if (image->plan.region_count == PMP_ENTRIES) {
+                    planning.error = "invalid effective memory plan";
+                    return false;
+                }
+                image->plan.regions[image->plan.region_count++] =
+                    (PmpRegion){node->base, node->size, modes[node->permission]};
+            }
+            if (!planning.depth) {
+                planning.verifying = true;
+                planning.verify_cursor = GUEST_BASE;
+            } else
+                --planning.depth;
+        }
+    }
+    *error = planning.done ? planning.error : NULL;
+    return planning.done;
 }
 
 const char *memory_plan_build(Image *image, SnapshotPolicy policy) {
-    image->plan.requested = policy;
-    if (policy != SNAP_OFF) {
-        const uint32_t alignments[] = {STACK_SIZE, 32};
-        for (unsigned i = 0; i < 2; ++i) {
-            const char *error = layout(image, true, alignments[i]);
-            if (!error && image->plan.heap_limit - image->plan.heap_base >= HEAP_RESERVE)
-                return NULL;
-        }
+    const char *error = NULL;
+    memory_plan_start(image, policy);
+    while (!memory_plan_step(&error)) {
     }
-    return layout(image, false, STACK_SIZE);
+    return error;
 }
 
 #ifdef MONITOR_NATIVE_TEST
