@@ -25,6 +25,9 @@ static uint8_t incoming[8192], outgoing[8192];
 static uint8_t read_bytes[8];
 static size_t read_count, read_cursor;
 static size_t in_count, in_cursor, out_count;
+static char console_text[16384];
+static size_t console_size, console_available = 8192;
+static bool capture_console;
 uint8_t *physical(uint32_t address) {
     assert(address >= 0x20000000 && address < 0x20082000);
     return ram + address - 0x20000000;
@@ -43,7 +46,7 @@ void monitor_panic(const char *message) {
     abort();
 }
 size_t console_space(void) {
-    return 8192;
+    return console_available;
 }
 void shell_prompt(void) {}
 void shell_notice(const char *message) {
@@ -73,7 +76,15 @@ size_t guest_output_write(const void *bytes, size_t count) {
     return count;
 }
 void console_printf(const char *format, ...) {
-    (void)format;
+    if (!capture_console)
+        return;
+    va_list args;
+    va_start(args, format);
+    int count =
+        vsnprintf(console_text + console_size, sizeof(console_text) - console_size, format, args);
+    va_end(args);
+    assert(count >= 0 && (size_t)count < sizeof(console_text) - console_size);
+    console_size += (size_t)count;
 }
 bool upload_connected(void) {
     return true;
@@ -289,6 +300,19 @@ static void flexible_checks(void) {
     assert(!guest_range(0x10000000, 1, false));
     assert(!guest_range(program.image.plan.snapshot_base, 1, false));
 
+    /* Unmapped program headers omit PHDR metadata and still terminate auxv. */
+    Image unmapped = image;
+    unmapped.phoff = sizeof(file);
+    program_install(&unmapped);
+    assert(!program_launch(0, NULL));
+    uint32_t aux = program.threads[0].frame.x[12] + 4;
+    assert(read_le32(physical(aux)) == 6 && read_le32(physical(aux + 4)) == 4096);
+    assert(read_le32(physical(aux + 8)) == 9);
+    assert(read_le32(physical(aux + 12)) == image.entry);
+    assert(read_le32(physical(aux + 16)) == 0 && read_le32(physical(aux + 20)) == 0);
+
+    /* Mapped headers follow the common entries before the terminating pair. */
+    program_install(&image);
     const char *args[] = {"one", "two words", ""};
     assert(!program_launch(3, args));
     uint32_t sp = program.threads[0].frame.x[2];
@@ -296,6 +320,16 @@ static void flexible_checks(void) {
     assert(!strcmp((char *)physical(read_le32(physical(sp + 12))), "two words"));
     assert(read_le32(physical(sp + 24)) == 0);
     assert(program.threads[0].frame.x[12] == sp + 24);
+    aux = sp + 28;
+    assert(read_le32(physical(aux)) == 6 && read_le32(physical(aux + 4)) == 4096);
+    assert(read_le32(physical(aux + 8)) == 9);
+    assert(read_le32(physical(aux + 12)) == image.entry);
+    assert(read_le32(physical(aux + 16)) == 3);
+    assert(read_le32(physical(aux + 20)) == TEXT_BASE + image.phoff);
+    assert(read_le32(physical(aux + 24)) == 4 && read_le32(physical(aux + 28)) == 32);
+    assert(read_le32(physical(aux + 32)) == 5);
+    assert(read_le32(physical(aux + 36)) == image.phnum);
+    assert(read_le32(physical(aux + 40)) == 0 && read_le32(physical(aux + 44)) == 0);
     uint32_t base = program.current_break;
     program.threads[0].frame.cause = 8;
     program.threads[0].frame.x[17] = 214;
@@ -303,10 +337,10 @@ static void flexible_checks(void) {
     memset(physical(base), 0xaa, 1500);
     program_after_trap(0);
     program_step();
-    assert(program.state == WAITING);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
     assert(!guest_range(base, 1, true));
     program_step();
-    assert(program.state == WAITING);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
     program_step();
     assert(program.current_break == base + 1500 && guest_range(base, 1500, true));
     for (unsigned i = 0; i < 1500; ++i)
@@ -330,14 +364,17 @@ static void flexible_checks(void) {
     program.threads[0].frame.x[12] = 700;
     program_after_trap(0);
     program_step();
-    assert(program.state == WAITING && guest_output_count == 256);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting") &&
+           guest_output_count == 256);
     program_step();
-    assert(program.state == WAITING && guest_output_count == 300);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting") &&
+           guest_output_count == 300);
     program_suspend("test");
-    assert(program.state == STOPPED && program.stopped_state == WAITING);
-    program.state = program.stopped_state;
+    assert(program.state == STOPPED && !strcmp(program_state_name(), "stopped"));
+    program_resume();
     program_step();
-    assert(program.state == WAITING && guest_output_count == 300);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting") &&
+           guest_output_count == 300);
     guest_output_credit = 400;
     program_step();
     program_step();
@@ -544,6 +581,64 @@ static void transfer_checks(const uint8_t *file, uint32_t size) {
     assert(response.type == WIRE_RESULT && response.payload[0] == 1 && response.payload[1] == 1);
 }
 
+/* A synthetic map exercises exact ELF edges within PMP granules, overlapping
+ * requirements, first-match entries, heap accounting, and the system denial. */
+static void map_checks(void) {
+    program_forget();
+    Image image = {.segment_count = 3};
+    image.segments[0] =
+        (Segment){.address = GUEST_BASE + 33, .memory_size = 63, .permissions = PERM_R | PERM_X};
+    image.segments[1] =
+        (Segment){.address = GUEST_BASE + 64, .memory_size = 64, .permissions = PERM_R | PERM_W};
+    image.segments[2] =
+        (Segment){.address = GUEST_BASE + 128, .memory_size = 32, .permissions = PERM_X};
+    MemoryPlan *p = &image.plan;
+    p->heap_base = GUEST_BASE + 192;
+    p->snapshot_base = p->stack_top = GUEST_END - 0x4000;
+    p->stack_base = p->stack_top - STACK_SIZE;
+    p->heap_limit = p->stack_base - 1024;
+    p->snapshot = true;
+    p->snapshot_size = 64;
+    p->region_count = 5;
+    p->regions[0] = (PmpRegion){GUEST_BASE + 64, 32, 7};
+    p->regions[1] = (PmpRegion){GUEST_BASE, 0x40000, 7};
+    p->regions[2] = (PmpRegion){GUEST_BASE + 0x40000, 0x20000, 6};
+    p->regions[3] = (PmpRegion){GUEST_BASE + 0x60000, 0x10000, 6};
+    p->regions[4] = (PmpRegion){GUEST_BASE + 0x70000, 0x8000, 6};
+    program_install(&image);
+    program.current_break = GUEST_BASE + 224;
+    capture_console = true;
+    console_size = 0;
+    memory_map_start();
+    console_available = 511;
+    memory_map_step();
+    assert(!console_size && memory_map_busy());
+    console_available = 8192;
+    for (unsigned i = 0; memory_map_busy() && i < 100; ++i) {
+        size_t previous = console_size;
+        memory_map_step();
+        assert(console_size - previous <= 512);
+    }
+    assert(!memory_map_busy());
+    assert(strstr(console_text, "Required  Effective  PMP"));
+    assert(strstr(console_text, "20000021..20000040  ELF            r-x       rwx        1"));
+    assert(strstr(console_text, "20000040..20000060  ELF            rwx       rwx        0"));
+    assert(strstr(console_text, "20000080..200000a0  ELF            --x       rwx        1"));
+    assert(strstr(console_text, "200000c0..200000e0  heap used      rw-       rwx        1"));
+    assert(strstr(console_text, "200000e0..20040000  heap capacity  rw-       rwx        1"));
+    assert(strstr(console_text, "20073c00..20074000  stack guard    ---       rw-        4"));
+    assert(strstr(console_text, "20074000..20078000  stack          rw-       rw-        4"));
+    assert(strstr(console_text, "20078000..2007c000  reset reserve  ---       ---        7"));
+    assert(strstr(console_text, "2007c000..20080000  monitor        ---       ---        7"));
+    assert(strstr(console_text, "PMP 0  20000040..20000060  rwx     NAPOT  08000013"));
+    assert(strstr(console_text, "PMP 5  (unused)"));
+    assert(strstr(console_text, "3fffffff (system deny)"));
+    capture_console = false;
+    program_forget();
+    memory_map_start();
+    assert(!memory_map_busy());
+}
+
 static int32_t invoke(unsigned core, uint32_t number, uint32_t a0, uint32_t a1, uint32_t a2) {
     GuestFrame *f = &program.threads[core].frame;
     f->cause = 8;
@@ -573,7 +668,8 @@ static void thread_checks(void) {
         assert(second->frame.x[i] == (i == 10 ? 0x76543210u : 0));
     assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0, 0) == -11);
     invoke(0, SYS_EXIT, 0, 0, 0);
-    assert(program.threads[0].state == THREAD_UNUSED && program.state == RUNNING);
+    assert(program.threads[0].state == THREAD_UNUSED && program.state == ACTIVE &&
+           !strcmp(program_state_name(), "running"));
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE + 1, 0, 0) == -14);
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_END, 0, 0) == -14);
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE, 123, 0) == 0);
@@ -583,6 +679,18 @@ static void thread_checks(void) {
     memset(physical(base), 0xcc, 3072);
     invoke(0, SYS_BRK, base + 2048, 0, 0);
     invoke(1, SYS_BRK, base + 3072, 0, 0);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
+    program_suspend("heap growth");
+    assert(program.state == STOPPED);
+    PendingCall growth = program.threads[0].pending;
+    program_step();
+    assert(program.current_break == base);
+    assert(program.threads[0].pending.kind == CALL_BRK);
+    assert(program.threads[0].pending.heap.target == growth.heap.target &&
+           program.threads[0].pending.heap.cursor == growth.heap.cursor &&
+           program.threads[0].pending.heap.started == growth.heap.started);
+    program_resume();
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
     while (program.threads[0].state == THREAD_BLOCKED || second->state == THREAD_BLOCKED)
         program_step();
     assert(program.current_break == base + 3072);
@@ -591,7 +699,15 @@ static void thread_checks(void) {
 
     /* Read order follows requests rather than slot numbers or service order. */
     invoke(1, SYS_READ, 0, base + 1, 1);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "running"));
     invoke(0, SYS_READ, 0, base, 1);
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
+    program_suspend("pending reads");
+    program_step();
+    assert(program.state == STOPPED && program.threads[0].pending.kind == CALL_READ &&
+           second->pending.kind == CALL_READ);
+    program_resume();
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "waiting"));
     memcpy(read_bytes, "xy", 2);
     read_count = 2;
     read_cursor = 0;
@@ -608,16 +724,50 @@ static void thread_checks(void) {
     program_suspend("test");
     assert(program.state == STOPPING);
     program_step();
-    assert(program.threads[0].pending.count == 128);
-    second->frame.cause = UINT32_C(0x80000007);
+    assert(program.threads[0].pending.io.remaining == 128);
+    /* A syscall trapped during the barrier stays unconsumed until resume. */
+    uint32_t pc = second->frame.pc;
+    second->frame.cause = 8;
+    second->frame.x[17] = SYS_YIELD;
     program_after_trap(1);
     assert(program.state == STOPPED && program_quiescent());
+    program_step();
+    assert(second->trap_pending && second->frame.pc == pc);
     program_resume();
+    assert(program.state == ACTIVE && !strcmp(program_state_name(), "running"));
+    program_step();
+    assert(!second->trap_pending && second->frame.pc == pc + 4 && second->frame.x[10] == 0);
     invoke(1, SYS_BRK, base, 0, 0);
     program_step();
     program_step();
     assert((int32_t)program.threads[0].frame.x[10] == -14);
     guest_output_credit = SIZE_MAX;
+
+    /* Both breakpoint widths stop the peer before exposing the prompt. A
+     * peer breakpoint during the barrier is consumed without another stop. */
+    const uint8_t breaks[] = {0x73, 0x00, 0x10, 0x00, 0x02, 0x90};
+    memcpy(physical(GUEST_BASE), breaks, sizeof(breaks));
+    for (unsigned core = 0; core < 2; ++core) {
+        GuestThread *thread = &program.threads[core];
+        GuestThread *peer = &program.threads[core ^ 1u];
+        thread->frame.pc = GUEST_BASE;
+        thread->frame.cause = 3;
+        thread->frame.x[10] = 123;
+        peer->executing = true;
+        program_after_trap(core);
+        assert(program.state == STOPPING && thread->frame.pc == GUEST_BASE + 4);
+        assert(!thread->trap_pending && thread->frame.x[10] == 123);
+        peer->frame.pc = GUEST_BASE + 4;
+        peer->frame.cause = 3;
+        program_after_trap(core ^ 1u);
+        assert(program.state == STOPPED && program_quiescent());
+        assert(peer->frame.pc == GUEST_BASE + 6 && !peer->trap_pending);
+        program_step();
+        program_resume();
+        program_step();
+        assert(program.state == ACTIVE && thread->frame.pc == GUEST_BASE + 4 &&
+               peer->frame.pc == GUEST_BASE + 6);
+    }
 
     /* Group exit waits for the other core, while a fault preserves both
      * frames and prohibits resuming either thread. */
@@ -659,6 +809,8 @@ int main(int argc, char **argv) {
     flexible_checks();
     solver_oracle();
     transfer_checks(file, (uint32_t)length);
+    assert(!memory_map_busy());
+    map_checks();
     thread_checks();
     free(file);
     puts("native checks: ELF rejection, streaming, reset, framing, retries, cancellation passed");

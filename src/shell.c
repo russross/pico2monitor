@@ -43,7 +43,7 @@ void shell_init(void) {
 }
 
 static void info(void) {
-    console_printf("state: %s%s\r\n", program_state_name(program.state),
+    console_printf("state: %s%s\r\n", program_state_name(),
                    program.reset_busy ? " (reset in progress)" : "");
     if (program.valid) {
         console_printf("image: %s size=%lu crc=%08lx entry=%08lx\r\n", program.image.name,
@@ -51,12 +51,11 @@ static void info(void) {
                        (unsigned long)program.image.entry);
         for (uint32_t i = 0; i < program.image.segment_count; ++i) {
             const Segment *s = &program.image.segments[i];
-            const char *permissions = s->permissions & PERM_W   ? "RW"
-                                      : s->permissions & PERM_X ? "RX"
-                                                                : "R";
-            console_printf("  %-2s %08lx mem=%lu file=%lu offset=%lu\r\n", permissions,
-                           (unsigned long)s->address, (unsigned long)s->memory_size,
-                           (unsigned long)s->file_size, (unsigned long)s->offset);
+            console_printf("  %c%c%c %08lx mem=%lu file=%lu offset=%lu\r\n",
+                           s->permissions & PERM_R ? 'r' : '-', s->permissions & PERM_W ? 'w' : '-',
+                           s->permissions & PERM_X ? 'x' : '-', (unsigned long)s->address,
+                           (unsigned long)s->memory_size, (unsigned long)s->file_size,
+                           (unsigned long)s->offset);
         }
         console_printf("stack: %08lx..%08lx RW\r\n", (unsigned long)program.image.plan.stack_base,
                        (unsigned long)program.image.plan.stack_top);
@@ -288,8 +287,8 @@ void shell_step(void) {
     }
     memory_map_step();
     if (prompt_pending && console_connected() && console_empty() && !program.reset_busy &&
-        !memory_map_busy() && program.state != RUNNING && program.state != WAITING &&
-        !transfer_active() && program.state != STOPPING && program_quiescent()) {
+        !memory_map_busy() && program.state != ACTIVE && !transfer_active() &&
+        program.state != STOPPING && program_quiescent()) {
         console_printf("pico> ");
         prompt_pending = false;
     }

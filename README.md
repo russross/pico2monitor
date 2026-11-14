@@ -11,7 +11,7 @@ Build and use
 
 1. On Linux x86-64, install GNU Make, a C compiler, Python 3.13 or later, `patch`, `uv`, and Debian/Ubuntu `apt-get`, `dpkg-deb`, and the `libclang-cpp19` and `libllvm19` runtime packages for formatting checks. Run `make`; `make deps` downloads and verifies the pinned SDK, compiler, CMake, picotool, and emulator header into `deps/`. The first run needs network access.
 2. Flash explicitly with `make flash` (which uses sudo for picotool).
-3. Run `./dist/pico build/assembly.elf` to connect, upload, and keep the console open. The monitor prints the loaded image's memory map.
+3. Run `./dist/pico build/assembly.elf` to connect, upload, and keep the console open. The monitor prints a one-line load summary; type `map` to inspect memory and protections.
 4. Type `run`. Ctrl-C/Escape suspends; `resume` continues; `reset` prepares another run. Ctrl-D at the monitor, Ctrl-], or `quit` detaches the host console; Ctrl-D in a guest sends terminal EOF.
 
 Both channels use the same USB cable. `pico` connects without uploading. `pico --send FILE` uploads without opening a console; first type `load` in an existing console. The script uses only Python's standard library and Unix serial interfaces; it needs no SDK or third-party Python packages. Stable serial identities are selected automatically; `--console-port DEVICE` and `--upload-port DEVICE` override them. Console is -if00 and upload is -if02. Install the existing desktop access/ModemManager rule with `make install-udev`, then reconnect. No UART adapter is required.

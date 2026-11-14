@@ -53,25 +53,23 @@ const char *program_launch(unsigned argc, const char *const *argv) {
     memcpy(physical(cursor), &word, 4);
     cursor += 4;
     /* AT_PAGESZ describes the nominal userspace ABI unit, not an MMU mapping. */
-    uint32_t aux[] = {6, 4096, 9, program.image.entry, 0, 0, 3, phdr,
-                      4, 32,   5, program.image.phnum};
+    const uint32_t aux[] = {6, 4096, 9, program.image.entry};
+    memcpy(physical(cursor), aux, sizeof(aux));
+    cursor += sizeof(aux);
     if (phdr) {
-        aux[4] = 3;
-        aux[5] = phdr;
-        aux[6] = 4;
-        aux[7] = 32;
-        aux[8] = 5;
-        aux[9] = program.image.phnum;
-        aux[10] = aux[11] = 0;
+        const uint32_t headers[] = {3, phdr, 4, 32, 5, program.image.phnum};
+        memcpy(physical(cursor), headers, sizeof(headers));
+        cursor += sizeof(headers);
     }
-    memcpy(physical(cursor), aux, aux_words * 4);
+    const uint32_t end[] = {0, 0};
+    memcpy(physical(cursor), end, sizeof(end));
     GuestThread *thread = &program.threads[0];
     thread->frame.x[2] = sp;
     thread->frame.x[10] = argc + 1;
     thread->frame.x[11] = argv_address;
     thread->frame.x[12] = envp_address;
     thread->state = THREAD_RUNNABLE;
-    program.state = RUNNING;
+    program.state = ACTIVE;
     guest_input_clear();
     return NULL;
 }

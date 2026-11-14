@@ -156,7 +156,7 @@ void io_service(void) {
     uint32_t count = tud_cdc_n_read(0, bytes, sizeof(bytes));
     discard_batch = false;
     for (uint32_t i = 0; i < count && !discard_batch; ++i) {
-        bool active = program.state == RUNNING || program.state == WAITING;
+        bool active = program.state == ACTIVE;
         if (active && (bytes[i] == 3 || bytes[i] == 27)) {
             program_suspend(bytes[i] == 3 ? "Ctrl-C" : "Escape");
             discard_batch = true;
@@ -164,7 +164,7 @@ void io_service(void) {
             guest_input_put(bytes[i]);
         else {
             shell_input(bytes[i]);
-            if (program.state == RUNNING || program.state == WAITING)
+            if (program.state == ACTIVE)
                 discard_batch = true;
         }
     }

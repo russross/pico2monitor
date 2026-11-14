@@ -16,10 +16,23 @@ class Session(Protocol):
 
 def check_exec(session: Session) -> None:
     session.load("rwx.elf")
+    info = session.command("info")
+    assert b"  rwx " in info, info
     output = session.command("run")
     assert b"RWX sandbox OK" in output and b"fault" not in output and b"exit:" not in output, output
     session.load("assembly.elf")
-    assert b"20000000" in session.command("map")
+    output = session.command("map")
+    for field in (
+        b"20000000",
+        b"Required  Effective  PMP",
+        b"heap capacity",
+        b"stack",
+        b"monitor",
+        b"PMP plan installed",
+        b"pmpaddr",
+        b"system deny",
+    ):
+        assert field in output, output
     assert b"hello from assembly" in session.command("run")
     session.load("exec.elf")
     output = session.command('run one "two words" ""')
@@ -72,6 +85,11 @@ def check_threads(session: Session) -> None:
 
     session.load("threads_fault.elf")
     output = session.command("run")
-    assert b"guest fault: cause=3 " in output and b"thread=1" in output, output
-    assert b"state: faulted" in session.command("info")
-    assert b"resume requires" in session.command("resume")
+    for _ in range(2):
+        assert b"suspended: ebreak" in output, output
+        info = session.command("info")
+        assert b"state: stopped" in info, info
+        assert b"thread 0: runnable" in info and b"thread 1: runnable" in info, info
+        output = session.command("resume")
+    assert b"exit:" not in output and b"fault" not in output, output
+    assert b"state: exited" in session.command("info")

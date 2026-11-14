@@ -21,14 +21,21 @@ typedef struct {
     uint32_t x[32];
     uint32_t pc, cause, status;
 } GuestFrame;
-typedef enum { EMPTY, READY, RUNNING, WAITING, STOPPED, EXITED, FAULTED, STOPPING } ProgramState;
+typedef enum { EMPTY, READY, ACTIVE, STOPPED, EXITED, FAULTED, STOPPING } ProgramState;
 typedef enum { THREAD_UNUSED, THREAD_RUNNABLE, THREAD_BLOCKED } ThreadState;
 typedef enum { CALL_NONE, CALL_READ, CALL_WRITE, CALL_SLEEP, CALL_BRK } PendingKind;
 typedef struct {
     PendingKind kind;
-    uint32_t address, count;
-    uint64_t deadline;
-    uint32_t written;
+    union {
+        struct {
+            uint32_t address, remaining, written;
+        } io;
+        struct {
+            uint32_t target, cursor;
+            bool started;
+        } heap;
+        uint64_t deadline;
+    };
     uint64_t order;
 } PendingCall;
 /* Only the owning core saves registers outside the monitor lock. Other cores
@@ -43,7 +50,6 @@ typedef struct {
 typedef struct {
     Image image;
     ProgramState state;
-    ProgramState stopped_state;
     GuestThread threads[2];
     bool valid, reset_busy;
     uint32_t reset_cursor;
@@ -91,7 +97,7 @@ void memory_map_start(void);
 void memory_map_step(void);
 bool memory_map_busy(void);
 const char *program_launch(unsigned argc, const char *const *argv);
-const char *program_state_name(ProgramState state);
+const char *program_state_name(void);
 
 void io_init(void);
 void io_service(void);

@@ -61,8 +61,13 @@ static void result(void) {
         console_printf("load failed: %s (%s)\r\n", loader.error,
                        payload[1] ? "previous image preserved" : "no runnable image");
     else {
-        console_printf("loaded: %s; ready\r\n", program.image.name);
-        memory_map_start();
+        const MemoryPlan *p = &program.image.plan;
+        console_printf(
+            "loaded: %s; ready; file=%lu bytes, heap=%lu KiB, stack=%lu KiB, reset=%s\r\n",
+            program.image.name, (unsigned long)program.image.file_size,
+            (unsigned long)((p->heap_limit - p->heap_base) / 1024),
+            (unsigned long)((p->stack_top - p->stack_base) / 1024),
+            p->snapshot ? "available" : "unavailable");
     }
     shell_prompt();
 }

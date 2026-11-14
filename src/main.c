@@ -83,8 +83,7 @@ GuestFrame *monitor_dispatch(unsigned core, bool guest_trap) {
     watchdog_update();
 #endif
     GuestThread *thread = &program.threads[core];
-    if ((program.state != RUNNING && program.state != WAITING) || program.reset_busy ||
-        thread->state != THREAD_RUNNABLE)
+    if (program.state != ACTIVE || program.reset_busy || thread->state != THREAD_RUNNABLE)
         return NULL;
     pmp_enable(&program.image.plan);
     thread->entered_at = monitor_time_us();

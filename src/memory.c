@@ -11,13 +11,14 @@ typedef struct {
 } Cell;
 typedef struct {
     uint64_t score;
-    uint8_t used, left;
+    uint8_t used, permission, left_budget;
     bool valid, install;
 } Choice;
 typedef enum { SCAN, LEAF, LEFT_CHILD, RIGHT_CHILD, COMBINE, SOLVED } SolveStage;
 typedef struct {
     Choice best[5][8], left[5][8];
-    uint32_t base, size, cursor, ordinal;
+    uint32_t base, size, cursor;
+    uint8_t inherited, budget, permission, left_budget;
     Cell first;
     SolveStage stage;
     bool uniform, legal;
@@ -156,30 +157,35 @@ static bool solve_step(void) {
             continue;
         }
 
-        /* Flat ordinals preserve the deterministic m/b/q/left tie order while
-         * allowing a monitor invocation to stop between any two candidates. */
+        /* Candidate counters advance in inherited/budget/permission/left order.
+         * Each combination remains a separate bounded unit of work. */
         bool leaf = w->stage == LEAF;
-        unsigned ordinal = w->ordinal++;
-        unsigned left = leaf ? 0 : ordinal % 8;
-        if (!leaf)
-            ordinal /= 8;
-        unsigned q = ordinal % 5, b = ordinal / 5 % 8, m = ordinal / 40;
+        unsigned m = w->inherited, b = w->budget, q = w->permission, left = w->left_budget;
         if (m == 5) {
             w->stage = SOLVED;
             continue;
+        }
+        if (leaf || ++w->left_budget == 8) {
+            w->left_budget = 0;
+            if (++w->permission == 5) {
+                w->permission = 0;
+                if (++w->budget == 8) {
+                    w->budget = 0;
+                    ++w->inherited;
+                }
+            }
         }
         uint8_t permission = modes[q];
         bool install = q != m;
         if (install && (!b || !w->legal))
             continue;
-        Choice v = {.install = install};
+        Choice v = {.permission = (uint8_t)q, .left_budget = (uint8_t)left, .install = install};
         if (leaf) {
             if ((w->first.trusted && permission) ||
                 (permission & w->first.required) != w->first.required)
                 continue;
             v.valid = true;
             v.used = install;
-            v.left = (uint8_t)q;
             v.score = reward(w->first, permission, w->base, w->size);
         } else {
             unsigned available = b - install;
@@ -190,7 +196,6 @@ static bool solve_step(void) {
             v.valid = l.valid && r.valid;
             v.score = l.score + r.score;
             v.used = (uint8_t)(l.used + r.used + install);
-            v.left = (uint8_t)(left | (q << 4));
         }
         if (better(v, w->best[m][b]))
             w->best[m][b] = v;
@@ -216,9 +221,9 @@ static void reconstruct(uint32_t base, uint32_t size, unsigned depth, unsigned i
         uniform = uniform && c.required == first.required && c.roles == first.roles &&
                   c.trusted == first.trusted;
     }
-    unsigned permission = uniform ? choice.left : choice.left >> 4;
+    unsigned permission = choice.permission;
     if (!uniform) {
-        unsigned left = choice.left & 15;
+        unsigned left = choice.left_budget;
         reconstruct(base, size / 2, depth + 1, permission, left, plan);
         reconstruct(base + size / 2, size / 2, depth + 1, permission,
                     budget - choice.install - left, plan);
@@ -416,8 +421,8 @@ bool memory_plan_step(const char **error) {
                 planning.error = "cannot isolate this layout with available PMP entries";
                 return false;
             }
-            node->permission = workspace[0].uniform ? choice.left : choice.left >> 4;
-            node->left = choice.left & 15;
+            node->permission = choice.permission;
+            node->left = choice.left_budget;
             node->install = choice.install;
             node->stage = workspace[0].uniform ? PLAN_EMIT : PLAN_LEFT;
         } else if (node->stage == PLAN_LEFT || node->stage == PLAN_RIGHT) {

@@ -5,10 +5,16 @@
 
 Program program;
 
-const char *program_state_name(ProgramState state) {
-    static const char *const names[] = {"empty",   "ready",  "running", "waiting",
-                                        "stopped", "exited", "faulted", "stopping"};
-    return names[state];
+/* Running and waiting describe the live threads, not separate lifecycle states. */
+const char *program_state_name(void) {
+    static const char *const names[] = {"empty",  "ready",   "active",  "stopped",
+                                        "exited", "faulted", "stopping"};
+    if (program.state == ACTIVE)
+        return program.threads[0].state == THREAD_RUNNABLE ||
+                       program.threads[1].state == THREAD_RUNNABLE
+                   ? "running"
+                   : "waiting";
+    return names[program.state];
 }
 
 bool program_quiescent(void) {
@@ -99,9 +105,8 @@ static void finish_stop(void) {
 }
 
 void program_suspend(const char *reason) {
-    if (program.state != RUNNING && program.state != WAITING)
+    if (program.state != ACTIVE)
         return;
-    program.stopped_state = program.state;
     program.state = STOPPING;
     program.stop_target = STOPPED;
     program.stop_reason = reason;
@@ -111,7 +116,7 @@ void program_suspend(const char *reason) {
 
 void program_resume(void) {
     if (program.state == STOPPED) {
-        program.state = program.stopped_state;
+        program.state = ACTIVE;
         guest_input_clear();
     }
 }
@@ -136,44 +141,44 @@ static bool first_call(const GuestThread *thread) {
  * accounts for a concurrent thread shrinking the shared logical heap. */
 static void poll_call(GuestThread *thread) {
     PendingCall *call = &thread->pending;
-    uint32_t count = call->count < IO_CHUNK ? call->count : IO_CHUNK;
     if (call->kind == CALL_READ || call->kind == CALL_WRITE) {
+        uint32_t count = call->io.remaining < IO_CHUNK ? call->io.remaining : IO_CHUNK;
         if (call->kind == CALL_READ && !first_call(thread))
             return;
-        if (!guest_range(call->address, count, call->kind == CALL_READ)) {
+        if (!guest_range(call->io.address, count, call->kind == CALL_READ)) {
             complete_call(thread, -14);
             return;
         }
         if (call->kind == CALL_READ) {
-            int32_t got = guest_input_read(physical(call->address), count);
+            int32_t got = guest_input_read(physical(call->io.address), count);
             if (got >= 0)
                 complete_call(thread, got);
         } else {
-            size_t sent = guest_output_write(physical(call->address), count);
-            call->address += (uint32_t)sent;
-            call->count -= (uint32_t)sent;
-            call->written += (uint32_t)sent;
-            if (!call->count)
-                complete_call(thread, (int32_t)call->written);
+            size_t sent = guest_output_write(physical(call->io.address), count);
+            call->io.address += (uint32_t)sent;
+            call->io.remaining -= (uint32_t)sent;
+            call->io.written += (uint32_t)sent;
+            if (!call->io.remaining)
+                complete_call(thread, (int32_t)call->io.written);
         }
     } else if (call->kind == CALL_SLEEP && monitor_time_us() >= call->deadline)
         complete_call(thread, 0);
     else if (call->kind == CALL_BRK && first_call(thread)) {
-        uint32_t target = call->address;
-        if (!call->written)
-            call->count = program.current_break;
-        if (target <= call->count) {
+        uint32_t target = call->heap.target;
+        if (!call->heap.started)
+            call->heap.cursor = program.current_break;
+        if (target <= call->heap.cursor) {
             program.current_break = target;
             complete_call(thread, (int32_t)target);
             return;
         }
-        uint32_t bytes = target - call->count;
+        uint32_t bytes = target - call->heap.cursor;
         if (bytes > 1024)
             bytes = 1024;
-        memset(physical(call->count), 0, bytes);
-        call->count += bytes;
-        call->written = 1;
-        if (call->count == target) {
+        memset(physical(call->heap.cursor), 0, bytes);
+        call->heap.cursor += bytes;
+        call->heap.started = true;
+        if (call->heap.cursor == target) {
             program.current_break = target;
             complete_call(thread, (int32_t)target);
         }
@@ -213,10 +218,10 @@ static int32_t thread_create(unsigned core, uint32_t pc, uint32_t parameter) {
 static void syscall_dispatch(unsigned core) {
     GuestThread *thread = &program.threads[core];
     GuestFrame *f = &thread->frame;
-    uint32_t number = f->x[17], fd = f->x[10], address = f->x[11], count = f->x[12];
+    uint32_t number = f->x[17];
     f->pc += 4;
     if (number == SYS_EXIT || number == SYS_EXIT_GROUP) {
-        program.exit_status = (int32_t)fd;
+        program.exit_status = (int32_t)f->x[10];
         thread->state = THREAD_UNUSED;
         thread->pending = (PendingCall){0};
         if (number == SYS_EXIT_GROUP || program.threads[core ^ 1u].state == THREAD_UNUSED)
@@ -224,10 +229,11 @@ static void syscall_dispatch(unsigned core) {
         return;
     }
     if (number == SYS_THREAD_CREATE) {
-        complete_call(thread, thread_create(core, fd, address));
+        complete_call(thread, thread_create(core, f->x[10], f->x[11]));
         return;
     }
     if (number == SYS_READ || number == SYS_WRITE) {
+        uint32_t fd = f->x[10], address = f->x[11], count = f->x[12];
         if ((number == SYS_READ && fd != 0) || (number == SYS_WRITE && fd != 1 && fd != 2))
             complete_call(thread, -9);
         else if (count > INT32_MAX)
@@ -238,8 +244,7 @@ static void syscall_dispatch(unsigned core) {
             complete_call(thread, 0);
         else {
             block_call(thread, (PendingCall){.kind = number == SYS_READ ? CALL_READ : CALL_WRITE,
-                                             .address = address,
-                                             .count = count});
+                                             .io = {.address = address, .remaining = count}});
             poll_call(thread);
         }
         return;
@@ -251,12 +256,14 @@ static void syscall_dispatch(unsigned core) {
         complete_call(thread, 0);
     else if (number == SYS_BRK) {
         const MemoryPlan *p = &program.image.plan;
-        if (fd >= p->heap_base && fd <= p->heap_limit)
-            block_call(thread, (PendingCall){.kind = CALL_BRK, .address = fd});
+        uint32_t target = f->x[10];
+        if (target >= p->heap_base && target <= p->heap_limit)
+            block_call(thread, (PendingCall){.kind = CALL_BRK, .heap = {.target = target}});
         else
             complete_call(thread, (int32_t)program.current_break);
     } else if (number == SYS_CLOCK_GETTIME64) {
-        if (fd != 1)
+        uint32_t clock_id = f->x[10], address = f->x[11];
+        if (clock_id != 1)
             complete_call(thread, -22);
         else if (!guest_range(address, 16, true))
             complete_call(thread, -14);
@@ -267,13 +274,14 @@ static void syscall_dispatch(unsigned core) {
             complete_call(thread, 0);
         }
     } else if (number == SYS_CLOCK_NANOSLEEP64) {
-        if (fd != 1 || address != 0)
+        uint32_t clock_id = f->x[10], flags = f->x[11], request = f->x[12];
+        if (clock_id != 1 || flags != 0)
             complete_call(thread, -22);
-        else if (!guest_range(count, 16, false))
+        else if (!guest_range(request, 16, false))
             complete_call(thread, -14);
         else {
             int64_t times[2];
-            memcpy(times, physical(count), sizeof(times));
+            memcpy(times, physical(request), sizeof(times));
             uint64_t now = monitor_time_us();
             if (times[0] < 0 || times[1] < 0 || times[1] >= 1000000000 ||
                 (uint64_t)times[0] > (UINT64_MAX - now - 1000000) / 1000000)
@@ -295,9 +303,17 @@ void program_after_trap(unsigned core) {
     thread->cpu_us += monitor_time_us() - thread->entered_at;
     thread->trap_pending = true;
     uint32_t cause = thread->frame.cause;
-    if (!(cause & UINT32_C(0x80000000)) && cause != 8
+    if (cause == 3 && range_contains(GUEST_BASE, GUEST_END - GUEST_BASE, thread->frame.pc, 2)) {
+        /* Breakpoints consume their instruction before closing both return
+         * paths, including when the peer is already acknowledging a stop. */
+        uint16_t instruction;
+        memcpy(&instruction, physical(thread->frame.pc), sizeof(instruction));
+        thread->frame.pc += (instruction & 3) == 3 ? 4 : 2;
+        thread->trap_pending = false;
+        program_suspend("ebreak");
+    } else if (!(cause & UINT32_C(0x80000000)) && cause != 8
 #ifdef MONITOR_EMULATOR
-        && cause != 11
+               && cause != 11
 #endif
     ) {
         thread->trap_pending = false;
@@ -358,7 +374,7 @@ void program_step(void) {
         reset_step();
         return;
     }
-    if (program.state != RUNNING && program.state != WAITING)
+    if (program.state != ACTIVE)
         return;
     for (unsigned i = 0; i < 2; ++i) {
         GuestThread *thread = &program.threads[i];
@@ -370,13 +386,9 @@ void program_step(void) {
                 dispatched = true;
             }
         }
-        if (program.state != RUNNING && program.state != WAITING)
+        if (program.state != ACTIVE)
             return;
         if (thread->state == THREAD_BLOCKED && !dispatched)
             poll_call(thread);
     }
-    program.state =
-        program.threads[0].state == THREAD_RUNNABLE || program.threads[1].state == THREAD_RUNNABLE
-            ? RUNNING
-            : WAITING;
 }

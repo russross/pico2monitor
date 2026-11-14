@@ -110,7 +110,14 @@ second_start:
 5:
     j 5b
 #else
+    .option push
+    .option norvc
     ebreak
+    .option pop
+    c.ebreak
+    li a0, 0
+    li a7, SYS_EXIT_GROUP
+    ecall
 #endif
 
 replacement:

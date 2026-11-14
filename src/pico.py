@@ -329,8 +329,7 @@ def console_session(port_name: str, image: Path | None, upload_name: str | None)
             wait_console(port, b"pico> ")
             port.write(b"load\r")
             wait_console(port, b"waiting for ELF")
-            message = send_file(image, upload_name, console=port)
-            write_output(f"\r\n{image}: {message}; ready to run\r\n".encode())
+            send_file(image, upload_name, console=port)
         pending = b""
         while True:
             ready = select.select([sys.stdin.fileno(), port.fd], [], [])[0]

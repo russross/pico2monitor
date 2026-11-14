@@ -46,7 +46,7 @@ Guest console output translates LF to CRLF. Input is echoed and buffered until E
 
 Arming load or accepting BEGIN preserves the previous image. The first accepted nonempty DATA block invalidates it immediately. After that, cancellation, corruption, or disconnect can leave no runnable image; upload again. The board never starts a partially loaded file. Power loss and monitor reboot discard the guest.
 
-The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. For exited programs, run automatically resets before starting again when reset support is retained. Suspended or faulted programs require explicit reset before a fresh run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
+The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. For exited programs, run automatically resets before starting again when reset support is retained. Suspended or faulted programs require explicit reset before a fresh run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. `ebreak` and `c.ebreak` also suspend both threads; resume continues after the breakpoint instruction. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
 
 
 Arguments
@@ -127,7 +127,11 @@ With reset support, reset restores initialized writable data and clears BSS, hea
 Read the memory map
 -------------------
 
-`map` prints ELF requirements, heap/break, stack, snapshot accounting, and actual PMP entries. The lowest-numbered matching entry wins; entries can overlap. A broad RWX grant can therefore contain earlier RX, RW, or denied exceptions. The system-wide denial is always installed after those entries.
+A successful load prints one summary line with the image name, file size, heap capacity, stack size, and reset availability. It does not print the map automatically.
+
+`map` prints an address-ordered table with exclusive end addresses. Each row identifies ELF memory, used heap, remaining heap capacity, the stack guard, stack, reset reservation, or monitor storage. Rows split at ELF, allocation, and PMP boundaries. Required permissions are the union of ELF requests or runtime needs; effective permissions come from the lowest-numbered matching PMP entry, identified in the last column. Effective `---` means denied access. Extra effective permissions show where internal protections were relaxed. Heap capacity is mapped even above the logical break; syscall buffer checks additionally enforce that break.
+
+The following PMP report lists all eight configurable entries, including unused OFF entries and the system-wide denial at entry 7. It shows address ranges, access, NAPOT mode, and encoded pmpaddr values for the plan installed on guest entry. Entries can overlap: a broad RWX grant can contain earlier RX, RW, or denied exceptions. This is the guest plan rather than a readback of the temporarily disabled grants while the monitor handles the command. Reset accounting and monitor SRAM/stack measurements accompany the report.
 
 Protections prioritize a useful stack guard, text write protection, constant-data write protection, non-executable writable memory, then denial of unused space. Boundaries may grant more access than ELF requests. A large stack adjustment can skip a guard. Do not make program correctness depend on an internal guard or permission fault.
 

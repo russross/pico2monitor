@@ -74,6 +74,11 @@ class Emulator:
         output = self.until(b"pico> ")
         if name.encode() not in output:
             raise AssertionError(f"loaded image name missing: {output!r}")
+        for field in (b"file=", b"heap=", b"stack=", b"reset="):
+            if field not in output:
+                raise AssertionError(f"load summary missing {field!r}: {output!r}")
+        if b"PMP " in output or b"Guest memory map" in output or b"monitor: static=" in output:
+            raise AssertionError(f"unexpected automatic map: {output!r}")
 
 
 @contextmanager
@@ -168,6 +173,7 @@ class MonitorTests(unittest.TestCase):
                         until(b"pico> ")
                         os.write(master, b"run\r")
                         until(b"syscalls and reset state OK")
+                        self.assertNotIn(b"loaded; ready to run", output)
                     os.write(master, b"\x1d")
                     self.assertEqual(process.wait(timeout=3), 0, bytes(output))
                 finally:
