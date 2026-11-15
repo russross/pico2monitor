@@ -30,7 +30,7 @@ Guest images can link at the stable SRAM base, 0x20000000. The monitor executes 
 
 Either core can enter the monitor through a stack-free atomic gate. Monitor calls advance bounded state-machine work and release the lock before resuming a guest or waiting for an interrupt. Custom syscall 1000 starts a second thread at a supplied PC with a parameter in a0 and all other registers zero. Guests own additional stack and TLS arrangements; no special load mode is needed. Ctrl-C/Escape suspends both threads before presenting the prompt.
 
-The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `suspend`, `io [merge]`, `info`, `map`, `help [COMMAND]`, `quit`, and `bootsel`.
+The shell provides `load [--no-reset]`, `run [args]`, `reset`, `resume`, `suspend`, `io [merge]`, `info`, `map`, `*`, `help [COMMAND]`, `quit`, and `bootsel`. With a loaded, stopped guest, `*` opens memory inspection: `list` disassembles, `dump` shows bytes and ASCII, `.pc` selects the saved PC, and `hart0`/`hart1` selects a retained hart. Escape/Ctrl-C returns to the shell. See [guest inspection](EXECUTABLES.md#guest-inspection) for cursor commands and output rules.
 
 Loading retains initialized writable data for reset when the verified layout leaves at least 32 KiB of heap capacity. Otherwise reset support is automatically disabled. `load --no-reset` omits reset storage for that upload. Reset requires retained support; its memory/PMP layout stays fixed until reload. Arguments remain supported; the environment is always empty.
 

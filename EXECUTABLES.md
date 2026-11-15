@@ -51,6 +51,20 @@ Arming load or accepting BEGIN preserves the previous image. The first accepted 
 The last thread's exit status, or an exit_group status, becomes the program status; zero is silent and nonzero is printed. A fault stops both threads and reports the faulting thread, cause, PC, and SP. The chip does not supply a reliable faulting address. For exited programs, run automatically resets before starting again when reset support is retained. Suspended or faulted programs require explicit reset before a fresh run. Ctrl-C/Escape suspends both threads, including infinite loops, before showing the monitor prompt. `ebreak` and `c.ebreak` also suspend both threads; resume continues after the breakpoint instruction. Resume preserves both contexts and pending calls; reset discards both and prepares only the initial thread.
 
 
+Guest inspection
+----------------
+
+Type `*` at the monitor prompt with a loaded guest in reset, suspended, exited, or faulted state. Suspend a running guest first. The prompt changes to `* `. Escape or Ctrl-C returns to `pico> `, including during a listing or dump. Inspection never changes guest bytes or registers.
+
+The status line shows the selected hart, saved PC, current break, saved SP, cursor (`.`), and hart status. `reset` means ready for its first run after load/reset, `stopped` means resumable, `exited` means terminated by an exit syscall, and `faulted` identifies a hart that trapped synchronously. A peer stopped by a fault remains `stopped`; the program still cannot resume. Exited harts retain the exit instruction's PC. The default selection is the sole remaining live hart, or hart0 when neither has priority. The other hart appears in parentheses only if it has saved state; `hart0` and `hart1` select such a hart without moving the cursor.
+
+1. `list` displays up to twenty instructions and moves the cursor past them. The decoder covers RV32IMAC, Zicsr, Zifencei, Zba, Zbb, Zbs, Zbkb, Zcb, Zcmp, and RP2350's custom Hazard3 bit-extract and power instructions. It prints ABI registers, explicit operands, and no pseudo-instruction rewrites. Small immediates use decimal digits; magnitudes above nine use hexadecimal. PC-relative targets appear in brackets. Unknown encodings print `???` and advance by two or four bytes according to the low bits. Odd addresses print `not aligned`; incomplete/out-of-range instructions print `address out of range` and leave the cursor unchanged.
+2. `dump` displays up to twenty rows, each ending at a sixteen-byte boundary, with a gap after eight bytes and printable ASCII on the right. The first row leaves spaces for bytes before the cursor. The cursor advances past displayed bytes. Both commands stop at the guest arena's upper boundary, excluding protected reset snapshots; unallocated heap and guest padding remain inspectable.
+3. A blank command repeats the preceding `list` or `dump`. Other commands clear that repeat selection.
+4. `. ADDRESS` or `.ADDRESS` sets the cursor; `.` alone shows status. Addresses are hexadecimal with optional `0x`. ABI register names take precedence over hexadecimal parsing, including names such as `a0`; `fp` also selects s0. Values at most 520 KiB receive the SRAM base, 0x20000000. Out-of-range addresses remain selectable and produce a warning.
+5. Cursor names are `pc` (selected hart's saved PC), `entry` (ELF entry), `heap` (initial break), `brk` (current break), `stack` (allocated stack bottom), `top` (allocated stack end), and `data` (lowest nonempty writable ELF load segment, falling back to the initial break). Every cursor command displays status.
+
+
 Arguments
 ---------
 

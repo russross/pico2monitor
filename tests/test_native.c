@@ -772,19 +772,26 @@ static void thread_checks(void) {
         .address = GUEST_BASE, .memory_size = 32, .file_size = 32, .permissions = PERM_R | PERM_X};
     assert(!memory_plan_build(&image, SNAP_OFF));
     program_install(&image);
+    assert(program.threads[0].present && !program.threads[1].present &&
+           program.threads[0].debug_status == HART_RESET);
     assert(!program_launch(0, NULL));
     assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0x76543210, 0) == 1);
     GuestThread *second = &program.threads[1];
     assert(second->state == THREAD_RUNNABLE && second->frame.pc == GUEST_BASE);
+    assert(second->present && second->debug_status == HART_STOPPED);
     for (unsigned i = 0; i < 32; ++i)
         assert(second->frame.x[i] == (i == 10 ? 0x76543210u : 0));
     assert(invoke(0, SYS_THREAD_CREATE, GUEST_BASE, 0, 0) == -11);
+    uint32_t exit_pc = program.threads[0].frame.pc;
     invoke(0, SYS_EXIT, 0, 0, 0);
+    assert(program.threads[0].present && program.threads[0].debug_status == HART_EXITED &&
+           program.threads[0].frame.pc == exit_pc);
     assert(program.threads[0].state == THREAD_UNUSED && program.state == ACTIVE &&
            !strcmp(program_state_name(), "running"));
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE + 1, 0, 0) == -14);
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_END, 0, 0) == -14);
     assert(invoke(1, SYS_THREAD_CREATE, GUEST_BASE, 123, 0) == 0);
+    assert(program.threads[0].debug_status == HART_STOPPED);
 
     /* Two heap expansions complete in request order with one published break. */
     uint32_t base = program.current_break;
@@ -889,6 +896,7 @@ static void thread_checks(void) {
     program.threads[0].frame.cause = UINT32_C(0x80000007);
     program_after_trap(0);
     assert(program.state == EXITED && program.exit_status == 7);
+    assert(program.threads[0].debug_status == HART_EXITED && second->debug_status == HART_EXITED);
     program_forget();
     program_install(&image);
     assert(!program_launch(0, NULL));
@@ -901,6 +909,7 @@ static void thread_checks(void) {
     program.threads[0].frame.cause = UINT32_C(0x80000007);
     program_after_trap(0);
     assert(program.state == FAULTED && second->frame.pc == GUEST_BASE + 2);
+    assert(second->debug_status == HART_FAULTED && program.threads[0].debug_status == HART_STOPPED);
     program_resume();
     assert(program.state == FAULTED);
 }

@@ -115,6 +115,61 @@ class MonitorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.emulator = self.enterContext(running_emulator())
 
+    def test_debug_console(self) -> None:
+        e = self.emulator
+        self.assertIn(b"no loaded program", e.command("*"))
+        e.load("hello.elf")
+        e.console.write(b"*\r")
+        status = e.until(b"\r\n* ")
+        self.assertIn(b"** hart0: pc=", status)
+        self.assertIn(b" reset\r\n", status)
+        self.assertNotIn(b"(hart1", status)
+
+        def debug(text: str) -> bytes:
+            e.console.write(text.encode() + b"\r")
+            return e.until(b"\r\n* ")
+
+        self.assertIn(b"has no saved state", debug("hart1"))
+        self.assertIn(b".=20000001", debug(".1"))
+        self.assertIn(b"not aligned", debug("list"))
+        debug(".entry")
+        listing = debug("list")
+        self.assertEqual(sum(row.startswith(b"0x") for row in listing.splitlines()), 20)
+        self.assertNotIn(b"???", listing)
+        self.assertEqual(sum(row.startswith(b"0x") for row in debug("").splitlines()), 20)
+        debug(". 37")
+        dump = debug("dump")
+        self.assertIn(b"0x20000037: ", dump)
+        self.assertIn(b"0x20000040: ", dump)
+        self.assertEqual(dump.count(b" | "), 20)
+        self.assertIn(b".=ffffffff", debug(". ffffffff"))
+        self.assertIn(b". is out of range", debug("."))
+        e.console.write(b"\x1b")
+        e.until(b"pico> ")
+        e.console.write(b"run\r")
+        e.until(b"pico> ")
+        e.console.write(b"*\r")
+        self.assertIn(b" exited\r\n", e.until(b"\r\n* "))
+        e.console.write(b"\x03")
+        e.until(b"pico> ")
+        self.assertIn(b"state: exited", e.command("info"))
+
+    def test_debug_two_harts(self) -> None:
+        e = self.emulator
+        e.load("threads_fault.elf")
+        e.console.write(b"run\r")
+        e.until(b"pico> ")
+        e.console.write(b"*\r")
+        status = e.until(b"\r\n* ")
+        self.assertIn(b"** hart0:", status)
+        self.assertIn(b"stopped (hart1 stopped)", status)
+        e.console.write(b"hart1\r")
+        self.assertIn(b"** hart1:", e.until(b"\r\n* "))
+        e.console.write(b".pc\r")
+        self.assertIn(b"** hart1:", e.until(b"\r\n* "))
+        e.console.write(b"\x03")
+        e.until(b"pico> ")
+
     def guest_until(self, port: SerialPort, marker: bytes) -> bytes:
         output = bytearray()
         deadline = time.monotonic() + 5

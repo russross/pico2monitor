@@ -23,6 +23,7 @@ typedef struct {
 } GuestFrame;
 typedef enum { EMPTY, READY, ACTIVE, STOPPED, EXITED, FAULTED, STOPPING } ProgramState;
 typedef enum { THREAD_UNUSED, THREAD_RUNNABLE, THREAD_BLOCKED } ThreadState;
+typedef enum { HART_RESET, HART_STOPPED, HART_EXITED, HART_FAULTED } HartStatus;
 typedef enum { CALL_NONE, CALL_READ, CALL_WRITE, CALL_SLEEP, CALL_BRK } PendingKind;
 typedef struct {
     PendingKind kind;
@@ -44,6 +45,8 @@ typedef struct {
     GuestFrame frame;
     PendingCall pending;
     ThreadState state;
+    HartStatus debug_status;
+    bool present;
     bool executing, trap_pending;
     uint64_t entered_at, cpu_us;
 } GuestThread;

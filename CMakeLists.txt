@@ -16,7 +16,7 @@ endif()
 # The emulator target is deliberately separate from the protected board image.
 foreach(target monitor monitor_emu)
     add_executable(${target} src/main.c src/memory.c src/launch.c src/map.c src/program.c src/trap.c src/entry.S src/pmp.c src/io.c src/shell.c
-        src/elf.c src/loader.c src/transfer.c src/wire.c src/usb_descriptors.c)
+        src/elf.c src/loader.c src/transfer.c src/wire.c src/usb_descriptors.c src/debug.c src/disasm.c)
     target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
     target_compile_definitions(${target} PRIVATE PICO_STACK_SIZE=4096 PICO_CORE1_STACK_SIZE=0
         PICO_HEAP_SIZE=256

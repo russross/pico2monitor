@@ -13,7 +13,7 @@ PY_FILES := $(wildcard src/*.py scripts/*.py tests/*.py)
 VERSION := $(strip $(file <VERSION))
 RELEASE_BUNDLE := dist/pico2monitor-$(VERSION).tar.gz
 
-.PHONY: all deps firmware guests emulator check native-check emulator-check panic-check format format-check flash install-udev clean
+.PHONY: all deps firmware guests emulator check native-check debug-check emulator-check panic-check format format-check flash install-udev clean
 all: dist/monitor.uf2 dist/pico guests build/emulator
 .PHONY: release
 release: $(RELEASE_BUNDLE)
@@ -71,6 +71,10 @@ build/test-native: tests/test_native.c $(addprefix src/,$(addsuffix .c,$(NATIVE_
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -Wshadow -fsanitize=address,undefined -DMONITOR_NATIVE_TEST -Isrc $< $(addprefix src/,$(addsuffix .c,$(NATIVE_SOURCES))) -o $@
 native-check: build/test-native guests
 	./build/test-native build/hello.elf
+build/test-debug: tests/test_debug.c src/debug.c src/disasm.c src/debug.h src/disasm.h src/monitor.h src/memory.h | build
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -Werror -Wshadow -fsanitize=address,undefined -DMONITOR_NATIVE_TEST -Isrc tests/test_debug.c src/debug.c src/disasm.c -o $@
+debug-check: build/test-debug
+	./build/test-debug
 emulator-check: build/emulator build/monitor_emu.hex guests
 	PYTHONPATH=src:tests python3 -m unittest -v test_emulator
 format:
@@ -87,6 +91,7 @@ deps/format-tools/usr/bin/clang-format-19:
 	cd deps/format-tools && apt-get download clang-format-19
 	dpkg-deb -x deps/format-tools/clang-format-19_*.deb deps/format-tools
 check: format-check
+	$(MAKE) debug-check
 	$(MAKE) native-check
 	PYTHONPATH=src:tests python3 -m unittest -v test_host
 	$(MAKE) emulator-check

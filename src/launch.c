@@ -69,6 +69,7 @@ const char *program_launch(unsigned argc, const char *const *argv) {
     thread->frame.x[11] = argv_address;
     thread->frame.x[12] = envp_address;
     thread->state = THREAD_RUNNABLE;
+    thread->debug_status = HART_STOPPED;
     program.state = ACTIVE;
     guest_input_clear();
     return NULL;

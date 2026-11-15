@@ -35,6 +35,7 @@ static void initial_frame(void) {
     memset(program.threads, 0, sizeof(program.threads));
     program.threads[0].frame.pc = program.image.entry;
     program.threads[0].frame.x[2] = program.image.plan.stack_top;
+    program.threads[0].present = true;
     program.current_break = program.image.plan.heap_base;
     program.exit_status = 0;
     program.stop_reason = NULL;
@@ -200,6 +201,8 @@ static int32_t thread_create(unsigned core, uint32_t pc, uint32_t parameter) {
     thread->frame.pc = pc;
     thread->frame.x[10] = parameter;
     thread->state = THREAD_RUNNABLE;
+    thread->present = true;
+    thread->debug_status = HART_STOPPED;
     return (int32_t)slot;
 }
 
@@ -209,6 +212,11 @@ static void syscall_dispatch(unsigned core) {
     uint32_t number = f->x[17];
     f->pc += 4;
     if (number == SYS_EXIT || number == SYS_EXIT_GROUP) {
+        f->pc -= 4;
+        thread->debug_status = HART_EXITED;
+        if (number == SYS_EXIT_GROUP && program.threads[core ^ 1u].present &&
+            program.threads[core ^ 1u].state != THREAD_UNUSED)
+            program.threads[core ^ 1u].debug_status = HART_EXITED;
         program.exit_status = (int32_t)f->x[10];
         thread->state = THREAD_UNUSED;
         thread->pending = (PendingCall){0};
@@ -306,6 +314,7 @@ void program_after_trap(unsigned core) {
     ) {
         thread->trap_pending = false;
         program.fault_thread = core;
+        thread->debug_status = HART_FAULTED;
         end_program(FAULTED);
     }
     finish_stop();

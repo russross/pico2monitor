@@ -104,3 +104,13 @@ Guest release, USB connection loss, monitor loss, and five-second heartbeat expi
 Protected static storage is 15216 bytes, 72 bytes above the preceding build, leaving 912 bytes after the SDK's 256-byte heap allowance. The 496 KiB guest arena and both 4 KiB scratch reservations remain unchanged. Byte-at-a-time shell admission reduces io_service's local stack frame to 64 bytes, and deferred formatting removes the previous combined cancellation/formatting chain. These compiler reports do not establish an all-path stack bound.
 
 Validation covers native ASan/UBSan ownership conflicts, retry replay, retained-owner uploads, both-hart recovery, DTR loss before notice delivery, lease expiry, and rejection without a monitor; four host framing/serial tests; twenty emulator workflows including the interactive send/attach CLI, terminal restoration, load-option forwarding, separate echo, partial-command redraw, queued output fences, and reupload on a retained guest connection; and the ten scheduled panic scenarios. Firmware and host artifacts are built under dist/. No hardware flashing or new hardware validation was performed.
+
+
+Guest disassembly and memory inspection (2026-11-14)
+--------------------------------------------------
+
+The shell's `*` mode inspects a loaded guest after suspension or termination. A switch/table decoder covers the RP2350 instruction set, including bit manipulation, Zcb, Zcmp, and custom Hazard3 power/bit-extract encodings. The debugger uses the shell's existing command storage and streams one display row per output fence; it allocates no persistent listing or dump buffer. Hart records retain presence and termination status, and syscall exits retain their instruction PC for postmortem inspection.
+
+Protected main-SRAM static use is 15252 bytes, 36 bytes above the preceding build: 16 bytes of hart metadata plus 25 bytes of debugger state, offset by 5 fewer alignment bytes. Initialized RAM remains 3852 bytes. The existing 256-byte heap allowance leaves 876 bytes inside the 16 KiB reservation. The 496 KiB guest arena, scratch output rings, and shared 4 KiB stack remain unchanged. Decoder tables and strings occupy flash. Compiler reports give debug_step a 176-byte frame and disassemble a 272-byte frame; formatting callees also consume stack, so these are not all-path bounds.
+
+A temporary baseline built from read-only Git source exposed a 604-byte Newlib SRAM dependency from strtoul. A bounded hexadecimal parser removes that dependency. Validation covers native sanitizers, assembler-derived opcode vectors, shell emulator workflows, and all ten scheduled panic scenarios. Updated firmware builds in build/; no hardware flashing or new hardware validation was performed.

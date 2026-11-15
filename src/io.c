@@ -1,3 +1,4 @@
+#include "debug.h"
 #include "monitor.h"
 #include "transfer.h"
 
@@ -181,7 +182,8 @@ void io_service(void) {
         bool active = program.state == ACTIVE;
         bool combined = active && !guest_attached();
         uint8_t byte;
-        bool urgent = active && tud_cdc_n_peek(0, &byte) && (byte == 3 || byte == 27);
+        bool urgent =
+            (active || debug_active()) && tud_cdc_n_peek(0, &byte) && (byte == 3 || byte == 27);
         if (!urgent &&
             ((!combined && !transfer_active() && !shell_accepting()) || console_space() < 32))
             break;

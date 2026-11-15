@@ -1,3 +1,4 @@
+#include "debug.h"
 #include "monitor.h"
 #include "transfer.h"
 
@@ -39,16 +40,17 @@ void shell_irq_masked(uint32_t number) {
     masked_irqs |= UINT64_C(1) << number;
 }
 bool shell_idle(void) {
-    return !command_pending && !run_pending && !memory_map_busy() && !transfer_active() &&
-           !program.reset_busy && !stopped_pending && !notice && !redrawing && !masked_irqs &&
-           length == 0;
+    return !debug_active() && !command_pending && !run_pending && !memory_map_busy() &&
+           !transfer_active() && !program.reset_busy && !stopped_pending && !notice && !redrawing &&
+           !masked_irqs && length == 0;
 }
 bool shell_accepting(void) {
-    return !command_pending && !run_pending && !prompt_pending && !memory_map_busy() &&
-           !program.reset_busy && !stopped_pending && !notice && !redrawing &&
+    return !debug_busy() && !command_pending && !run_pending && !prompt_pending &&
+           !memory_map_busy() && !program.reset_busy && !stopped_pending && !notice && !redrawing &&
            !guest_handoff_pending() && !masked_irqs && program.state != STOPPING;
 }
 void shell_disconnected(void) {
+    debug_leave();
     run_pending = false;
     command_pending = false;
     guest_disconnect("monitor connection lost");
@@ -147,6 +149,8 @@ typedef struct {
 } CommandHelp;
 
 static const CommandHelp commands[] = {
+    {"*", "*", "Inspect the stopped guest",
+     "Enter guest inspection; list, dump, . ADDRESS, hart0/hart1; Escape/Ctrl-C returns."},
     {"help", "help [COMMAND]", "Show command help", "Show all commands or details for COMMAND."},
     {"load", "load [--no-reset]", "Receive an ELF program",
      "Arm the upload port; --no-reset omits reset storage for this load."},
@@ -186,6 +190,11 @@ static void help(const char *name) {
 }
 
 static void execute(void) {
+    if (debug_active()) {
+        debug_command(line);
+        shell_prompt();
+        return;
+    }
     int argc = tokenize(args);
     if (argc <= 0) {
         if (argc < 0)
@@ -213,7 +222,9 @@ static void execute(void) {
         shell_prompt();
         return;
     }
-    if (strcmp(line, "help") == 0) {
+    if (strcmp(line, "*") == 0) {
+        debug_enter();
+    } else if (strcmp(line, "help") == 0) {
         if (argc > 2)
             error = "usage: help [COMMAND]";
         else
@@ -298,6 +309,13 @@ void shell_input(uint8_t byte) {
             transfer_cancel("cancelled from console");
         return;
     }
+    if (debug_active() && (byte == 3 || byte == 27)) {
+        debug_leave();
+        command_pending = false;
+        console_printf("\r\n");
+        shell_prompt();
+        return;
+    }
     if (!shell_accepting())
         return;
     if (byte == '\n' && swallow_lf) {
@@ -306,6 +324,7 @@ void shell_input(uint8_t byte) {
     }
     swallow_lf = byte == '\r';
     if (byte == 3 || byte == 27) {
+        debug_leave();
         console_printf("\r\n");
         shell_prompt();
         return;
@@ -361,6 +380,10 @@ void shell_step(void) {
     }
     if (memory_map_busy()) {
         memory_map_step();
+        return;
+    }
+    if (debug_busy()) {
+        debug_step();
         return;
     }
     if (masked_irqs) {
@@ -424,7 +447,7 @@ void shell_step(void) {
     if (prompt_pending && !program.reset_busy && (program.state != ACTIVE || guest_attached()) &&
         !transfer_active() && program.state != STOPPING &&
         (guest_attached() || program_quiescent())) {
-        console_printf("pico> ");
+        console_printf("%s", debug_active() ? "* " : "pico> ");
         prompt_pending = false;
         redraw_cursor = 0;
         redrawing = length != 0;
